@@ -1,0 +1,117 @@
+model_type: spme
+method: pinn
+
+# Save / logging
+save_dir: results/spme_pinn_from_nn_2000
+network_save_name: pinn_spme.pth
+history_save_name: pinn_spme_history.csv
+
+# Network
+batch_size: 256
+layer_lstm: 1
+layer_fc: 1
+hidden_lstm: 32
+hidden_fc: 128
+epochs: 1000
+lrate: 0.001
+decay_step: 500
+decay_rate: 0.999
+activation: tanh
+network_output: raw
+seed: 1234
+print_every: 20
+checkpoint_every: 1000
+keep_last_checkpoint: true
+save_optimizer_state: true
+resume_from_checkpoint:
+pretrained_nn_checkpoint: results/spme_nn/checkpoint_epoch_0002000.pth
+
+# Weights & Biases logging
+use_wandb: true
+wandb_project: pinn-spme
+wandb_run_name: spme-pinn
+wandb_mode: online
+wandb_plot_every: 100
+wandb_plot_samples: 20
+
+# Sequence / integration
+k: 90
+h: 1
+pinn_rollout_steps: 90
+integ_type: 0   # 0 = RK4, 1 = Euler
+electrolyte_integrator: implicit  # rk4 for debugging, implicit for h=1 training
+electrolyte_substeps: 1  # 1 for implicit, 5-20 for rk4 depending on h
+
+# Data
+data_source: csv
+data_dir: data
+train_data_files:
+  - spme_train_BJDST_soh90.csv
+  - spme_train_FUDS_soh90.csv
+  - spme_train_US06_soh90.csv
+val_data_files:
+  - spme_val_DST_soh90.csv
+test_data_files:
+  - spme_debug_CC_1C_discharge_soh90.csv
+
+# Window controls.
+# PINN batches preserve temporal order within each profile and only shuffle
+# profile order. Use stride 1 when enabling w_integ so neighboring-window
+# integration consistency matches the original SPM PINN algorithm.
+train_window_stride: 30
+val_window_stride: 30
+max_train_windows:
+max_val_windows:
+shuffle_pinn_profiles: true
+
+# Input scaling
+OneC: 5.0
+max_Crate: 4
+V_upper: 4.2
+V_lower: 2.5
+
+# SPMe discretization
+n_r: 15
+n_x_n: 10
+n_x_s: 5
+n_x_p: 10
+ce_min: 200.0
+ce_max: 2000.0
+temperature_K: 298.15
+use_electrolyte_activity: false
+disable_electrolyte_ohmic: false
+disable_electrolyte_concentration: false
+
+# Core low-loss philosophy
+w_v: 1.0
+w_li_s: 1.0
+w_li_e: 0.0
+w_integ: 1.0
+estimate_nLi_s: false
+estimate_nLi_e: false
+estimate_delta_sei: true
+nLi_s_fresh: 0.2840
+nLi_s_init: 0.2840
+nLi_e_init: 0.0053677182
+delta_sei_init: 1.0e-12
+delta_sei_lower: 0.0
+delta_sei_upper: 2.0e-6
+delta_sei_true: 5.05188e-07
+epsilon_e_n_true: 0.0560283
+R_f_n_base: 0.0
+rho_sei: 1690.0
+M_sei: 0.162
+kappa_sei: 1.0e-6
+lrate_sei: 0.001
+
+# PINN follows the original SPM style: no true-state supervision loss and
+# no extra soft BC loss terms. BCs are enforced through reconstruction/integration.
+supervise_states: false
+
+eval_every: 20
+full_eval_every: 100
+profile_timing: false
+profile_timing_every: 20
+profile_timing_warmup_epochs: 5
+debug_delta_sei_grad: false
+debug_delta_sei_grad_every: 20

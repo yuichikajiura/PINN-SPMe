@@ -1,0 +1,88 @@
+model_type: spme
+method: nn
+
+# Save / logging
+save_dir: results/spme_nn
+network_save_name: spme_nn.pth
+history_save_name: spme_nn_history.csv
+
+# Network
+batch_size: 256
+layer_lstm: 1
+layer_fc: 1
+hidden_lstm: 32
+hidden_fc: 128
+epochs: 50000
+lrate: 0.001
+decay_step: 500
+decay_rate: 0.999
+activation: tanh
+network_output: raw
+seed: 1234
+print_every: 100
+checkpoint_every: 1000
+keep_last_checkpoint: true
+save_optimizer_state: true
+resume_from_checkpoint:
+pretrained_nn_checkpoint:
+
+# Weights & Biases logging
+use_wandb: true
+wandb_project: pinn-spme
+wandb_run_name: spme-nn-state-supervision
+wandb_mode: online
+wandb_plot_every: 1000
+wandb_plot_samples: 20
+
+# Sequence / integration metadata
+k: 90
+h: 1
+integ_type: 1 # 0:RK4, 1:Euler
+electrolyte_integrator: implicit #rk4 or implicit
+electrolyte_substeps: 1 #1 for implicit, 20-40 for rk4 (depending on h)
+
+# Data
+data_source: csv
+data_dir: data
+train_data_files:
+  - spme_train_BJDST.csv
+  - spme_train_FUDS.csv
+  - spme_train_US06.csv
+val_data_files:
+  - spme_val_DST.csv
+test_data_files:
+  - spme_debug_CC_1C_discharge.csv
+
+# Window controls. Set stride to 1 to use every overlapping window.
+train_window_stride: 30
+val_window_stride: 30
+max_train_windows:
+max_val_windows:
+
+# Input scaling
+OneC: 5.0
+max_Crate: 4
+V_upper: 4.2
+V_lower: 2.5
+
+# SPMe discretization
+n_r: 15
+n_x_n: 10
+n_x_s: 5
+n_x_p: 10
+ce_min: 200.0
+ce_max: 2000.0
+temperature_K: 298.15
+use_electrolyte_activity: false
+disable_electrolyte_ohmic: false
+disable_electrolyte_concentration: false
+
+# Present only for compatibility with shared SPMe helpers; not used by method: nn.
+supervise_states: true
+w_state: 1.0
+w_v: 1.0
+w_li_s: 1.0
+w_li_e: 1.0
+w_integ: 1.0
+w_bounds: 0.01
+w_ce_int: 0.0
