@@ -7,7 +7,7 @@ network_save_name: pinn_spme.pth
 history_save_name: pinn_spme_history.csv
 
 # Network
-batch_size: 4096
+batch_size: 8192
 layer_lstm: 1
 layer_fc: 1
 hidden_lstm: 32
