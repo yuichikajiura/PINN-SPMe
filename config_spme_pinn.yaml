@@ -19,8 +19,8 @@ decay_rate: 0.9999
 activation: tanh
 network_output: raw
 seed: 1234
-print_every: 100
-checkpoint_every: 1000
+print_every: 20
+checkpoint_every: 100
 keep_last_checkpoint: true
 save_optimizer_state: true
 resume_from_checkpoint:
@@ -104,10 +104,10 @@ lrate_sei: 0.001
 # no extra soft BC loss terms. BCs are enforced through reconstruction/integration.
 supervise_states: false
 
-eval_every: 250
-full_eval_every: 1000
+eval_every: 100
+full_eval_every: 500
 profile_timing: true
-profile_timing_every: 1000
+profile_timing_every: 20
 profile_timing_warmup_epochs: 5
 profile_timing_log_wandb: true
 debug_delta_sei_grad: false
