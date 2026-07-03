@@ -1,11 +1,8 @@
 # PINN-SPMe
 
-Physics-informed and supervised neural-network training for lithium-ion battery state estimation with SPM and SPMe models.
+Physics-informed and supervised neural-network training for lithium-ion battery state estimation with SPMe models.
 
-This repository contains two related workflows:
-
-- **SPMe workflow:** the newer path for electrolyte-aware SPMe training from generated SPMe CSV datasets.
-- **Legacy SPM workflow:** the original PINN-SPM path for SPM-FDM data, parameter identification, and transfer learning.
+This repository contains the electrolyte-aware SPMe training workflow from generated SPMe CSV datasets.
 
 The single entry point is:
 
@@ -101,7 +98,7 @@ wandb_plot_every: 1
 
 | Option | Values | Meaning |
 |---|---|---|
-| `model_type` | `spme`, `spm` | Selects the SPMe code path or the legacy SPM code path. If omitted, legacy `spm` is used. |
+| `model_type` | `spme` | Selects the SPMe code path. |
 | `method` | `nn`, `pinn` | `nn` trains direct neural state prediction; `pinn` trains through model rollout and physics/data losses. |
 
 Current SPMe configs:
@@ -110,13 +107,6 @@ Current SPMe configs:
 |---|---|
 | `config_spme_nn.yaml` | Supervised SPMe NN training against actual state labels. Use this first to test network capacity. |
 | `config_spme_pinn.yaml` | SPMe PINN training with rollout, voltage, conservation, and integration-consistency losses. |
-
-Legacy SPM configs:
-
-| File | Purpose |
-|---|---|
-| `config_nn.yaml` | Original SPM NN pre-training path. |
-| `config_pinn.yaml` | Original SPM PINN parameter-identification path. |
 
 ### Save And Logging Options
 
@@ -139,9 +129,10 @@ Legacy SPM configs:
 | `wandb_plot_every` | `50` | Epoch interval for W&B plots. In PINN mode this controls full-profile plots independently from `full_eval_every`. |
 | `wandb_plot_samples` | `2` | Number of train/val samples to plot. |
 | `plot_samples` | `20` | Optional alias/override for per-dataset W&B spatial samples. |
-| `profile_timing` | `false` | Enable coarse timing of PINN training sections. Disabled by default. |
+| `profile_timing` | `true` | Enable detailed timing of PINN training sections. |
 | `profile_timing_every` | `20` | Display/log timing summaries every N displayed epochs when profiling is enabled. |
 | `profile_timing_warmup_epochs` | `5` | Skip timing summaries for the first N displayed epochs. |
+| `profile_timing_log_wandb` | `true` | Log detailed timing fields to W&B with `timing/..._s` keys. |
 | `debug_delta_sei_grad` | `false` | Print/log `delta_sei_scaled.grad` and derived SEI quantities after backward and before optimizer step. |
 | `debug_delta_sei_grad_every` | `20` | Epoch interval for the SEI gradient debug check. |
 
@@ -322,7 +313,7 @@ In `method: nn`, the network is trained directly against state labels using grou
 
 ## Data
 
-The `data/` directory contains both legacy SPM-FDM data and generated SPMe datasets.
+The `data/` directory contains generated SPMe datasets.
 
 ### SPMe Datasets
 
@@ -335,18 +326,6 @@ Current generated SPMe files:
 - `spme_debug_CC_1C_discharge_soh90.csv`
 
 These are used by `config_spme_nn.yaml` and `config_spme_pinn.yaml`.
-
-### Legacy SPM-FDM Datasets
-
-Legacy files follow:
-
-```text
-SPM_FDM_nr{n_r}_simulation_{Cycle}_cell{1|2}.csv
-```
-
-Available cycles include UDDS, FUDS, BJDST, Charge, Charge2, US06, US06 Extended, and DST where available. Ensure `n_r` in the legacy config matches the file family, for example `20` or `100`.
-
----
 
 ## Tests And Verification
 
@@ -372,7 +351,7 @@ The MATLAB cross-run test intentionally requires MATLAB. It should not be skippe
 
 ```text
 PINN-SPMe/
-|-- main.py                         # Entry point; dispatches by model_type and method
+|-- main.py                         # SPMe entry point; dispatches by method
 |-- config_spme_nn.yaml             # SPMe supervised NN state training
 |-- config_spme_pinn.yaml           # SPMe PINN training
 |-- train_pinn_spme.py              # Shared SPMe NN/PINN training code
@@ -380,44 +359,11 @@ PINN-SPMe/
 |-- spme_model.py                   # Differentiable SPMe rollout model
 |-- electrolyte_fvm.py              # Electrolyte FVM RHS and implicit/RK4 steps
 |-- losses_spme.py                  # SPMe voltage, conservation, bounds losses
-|-- config_nn.yaml                  # Legacy SPM NN config
-|-- config_pinn.yaml                # Legacy SPM PINN config
-|-- train_nn.py                     # Legacy SPM NN training
-|-- train_pinn.py                   # Legacy SPM PINN training
-|-- spm_fdm.py                      # Legacy SPM-FDM model
-|-- integrate_spmfdm.py             # Legacy SPM integration with NN output
-|-- integrator.py                   # Numerical integrators
-|-- init_params.py                  # SPM and SPMe parameters
-|-- helper_func.py                  # Data loading and shared utilities
-|-- data/                           # SPM and SPMe CSV data
+|-- init_params.py                  # SPMe parameters
+|-- data/                           # SPMe CSV data
 |-- tests/                          # SPMe verification tests
 `-- results/                        # Saved models, histories, plots, W&B files
 ```
-
----
-
-## Legacy SPM Usage
-
-The original SPM workflow remains available.
-
-NN pre-training:
-
-```bash
-python main.py config_nn.yaml
-```
-
-PINN training and parameter identification:
-
-```bash
-python main.py config_pinn.yaml
-```
-
-Important legacy options include:
-
-- `cell_known` / `cell_target`: 1 = fresh, 2 = aged.
-- `p_targets`: booleans for `[nLi, R_f_n, k_n, k_p, D_s_n, D_s_p]`.
-- `train_data_type` / `val_data_type`: driving-cycle selection.
-- `load_nn` / `suffix_nn`: load a pre-trained NN before PINN training.
 
 ---
 

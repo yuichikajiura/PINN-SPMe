@@ -98,32 +98,35 @@ class SPMeModel(nn.Module):
         self._update_solid_dynamics()
         param_dtype = torch.get_default_dtype()
         self.register_buffer(
-            'nLi_s_init',
-            torch.tensor(float(cfg.get('nLi_s_fresh', cfg.get('nLi_s_init', p.nLi_s))), dtype=param_dtype),
+            'nLi_total',
+            torch.tensor(float(getattr(p, 'nLi_s_fresh', getattr(p, 'nLi_s_init', p.nLi_s))), dtype=param_dtype),
         )
+        self.register_buffer('nLi_s_init', self.nLi_total.detach().clone())
         self.register_buffer(
             'nLi_e_init',
-            torch.tensor(float(cfg.get('nLi_e_init', p.nLi_e)), dtype=param_dtype),
+            torch.tensor(float(getattr(p, 'nLi_e_init', p.nLi_e)), dtype=param_dtype),
         )
         self.register_buffer(
             'epsilon_e_n_init',
-            torch.tensor(
-                float(cfg.get(
-                    'epsilon_e_n_fresh',
-                    p.epsilon_e_n + (p.a_s_n * float(cfg.get('delta_sei_init', 0.0)) if cfg.get('estimate_delta_sei', False) else 0.0),
-                )),
-                dtype=param_dtype,
-            ),
+            torch.tensor(float(getattr(p, 'epsilon_e_n_fresh', p.epsilon_e_n)), dtype=param_dtype),
         )
         self.register_buffer(
             'delta_sei_scale',
-            torch.tensor(float(cfg.get('delta_sei_scale', cfg.get('delta_sei_upper', 2e-6))), dtype=param_dtype),
+            torch.tensor(float(getattr(p, 'delta_sei_scale', 2e-6)), dtype=param_dtype),
         )
-        delta_init = float(cfg.get('delta_sei_init', 0.0))
+        self.register_buffer(
+            'C_li_sei_value',
+            torch.tensor((2 * p.rho_sei / p.M_sei) * p.a_s_n * p.Area_n * p.L_n, dtype=param_dtype),
+        )
+        self.register_buffer(
+            'nLi_e_delta_sei_coeff',
+            torch.tensor(p.A_e * p.c_e0 * p.L_n * p.a_s_n, dtype=param_dtype),
+        )
+        delta_init = float(getattr(p, 'delta_sei_init', 0.0))
         delta_scale = max(float(self.delta_sei_scale.detach().cpu()), 1e-30)
         self.delta_sei_scaled = nn.Parameter(
             torch.tensor([delta_init / delta_scale], dtype=param_dtype),
-            requires_grad=cfg.get('estimate_delta_sei', False),
+            requires_grad=bool(getattr(p, 'estimate_delta_sei', False)),
         )
 
     @property
@@ -132,49 +135,62 @@ class SPMeModel(nn.Module):
 
     @property
     def C_li_sei(self):
-        value = (2 * self.p.rho_sei / self.p.M_sei) * self.p.a_s_n * self.p.Area_n * self.p.L_n
-        return torch.as_tensor(value, dtype=self.delta_sei_est.dtype, device=self.delta_sei_est.device)
+        return self.C_li_sei_value.to(dtype=self.delta_sei_est.dtype, device=self.delta_sei_est.device)
 
-    @property
-    def nLi_sei_est(self):
-        return self.C_li_sei * self.delta_sei_est
+    def nLi_sei_from_delta(self, delta_sei):
+        delta_sei = torch.as_tensor(delta_sei, dtype=self.C_li_sei.dtype, device=self.C_li_sei.device)
+        return self.C_li_sei * delta_sei
 
-    @property
-    def nLi_s_est(self):
-        return self.nLi_s_init.to(dtype=self.delta_sei_est.dtype, device=self.delta_sei_est.device) - self.nLi_sei_est
+    def nLi_s_from_sei_inventory(self, nLi_sei):
+        nLi_sei = torch.as_tensor(nLi_sei, dtype=self.C_li_sei.dtype, device=self.C_li_sei.device)
+        return self.nLi_total.to(dtype=nLi_sei.dtype, device=nLi_sei.device) - nLi_sei
 
-    @property
-    def nLi_e_est(self):
-        if not self.cfg.get('estimate_delta_sei', False):
-            return self.nLi_e_init.to(dtype=self.delta_sei_est.dtype, device=self.delta_sei_est.device)
-        epsilon_e_n = self.epsilon_e_n_est
-        return self.p.A_e * self.p.c_e0 * (
-            epsilon_e_n * self.p.L_n + self.p.epsilon_e_s * self.p.L_s + self.p.epsilon_e_p * self.p.L_p
+    def epsilon_e_n_from_delta(self, delta_sei):
+        delta_sei = torch.as_tensor(delta_sei, dtype=self.C_li_sei.dtype, device=self.C_li_sei.device)
+        return self.epsilon_e_n_init.to(dtype=delta_sei.dtype, device=delta_sei.device) - self.p.a_s_n * delta_sei
+
+    def nLi_e_from_delta(self, delta_sei):
+        delta_sei = torch.as_tensor(delta_sei, dtype=self.C_li_sei.dtype, device=self.C_li_sei.device)
+        return (
+            self.nLi_e_init.to(dtype=delta_sei.dtype, device=delta_sei.device)
+            - self.nLi_e_delta_sei_coeff.to(dtype=delta_sei.dtype, device=delta_sei.device) * delta_sei
         )
 
-    @property
-    def epsilon_e_n_est(self):
-        return self.epsilon_e_n_init.to(dtype=self.delta_sei_est.dtype, device=self.delta_sei_est.device) - self.p.a_s_n * self.delta_sei_est
-
-    @property
-    def R_f_n_est(self):
-        default_base = 0.0 if self.cfg.get('estimate_delta_sei', False) else self.p.R_f_n
-        base = torch.as_tensor(self.cfg.get('R_f_n_base', default_base), dtype=self.delta_sei_est.dtype, device=self.delta_sei_est.device)
-        return base + self.delta_sei_est / self.p.kappa_sei
-
-    def electrolyte_dynamic(self, ref):
-        if not self.cfg.get('estimate_delta_sei', False):
-            return None
-        epsilon_e_n = self.epsilon_e_n_est.to(dtype=ref.dtype, device=ref.device)
+    def electrolyte_dynamic_from_delta(self, delta_sei, ref):
+        epsilon_e_n = self.epsilon_e_n_from_delta(delta_sei).to(dtype=ref.dtype, device=ref.device)
         return {
             'epsilon_e_n': epsilon_e_n,
             'src_coeff_n': (1 - self.p.t_plus) * self.p.a_s_n / epsilon_e_n,
             'eps_dx_n': epsilon_e_n * self.p.dx_n,
         }
 
+    @property
+    def nLi_sei_est(self):
+        return self.nLi_sei_from_delta(self.delta_sei_est)
+
+    @property
+    def nLi_s_est(self):
+        return self.nLi_s_from_sei_inventory(self.nLi_sei_est)
+
+    @property
+    def nLi_e_est(self):
+        return self.nLi_e_from_delta(self.delta_sei_est)
+
+    @property
+    def epsilon_e_n_est(self):
+        return self.epsilon_e_n_from_delta(self.delta_sei_est)
+
+    @property
+    def R_f_n_est(self):
+        base = torch.as_tensor(self.p.R_f_n_base, dtype=self.delta_sei_est.dtype, device=self.delta_sei_est.device)
+        return base + self.delta_sei_est / self.p.kappa_sei
+
+    def electrolyte_dynamic(self, ref):
+        return self.electrolyte_dynamic_from_delta(self.delta_sei_est, ref)
+
     def clamp_degradation_parameters(self):
-        lower = self.cfg.get('delta_sei_lower', None)
-        upper = self.cfg.get('delta_sei_upper', None)
+        lower = getattr(self.p, 'delta_sei_lower', None)
+        upper = getattr(self.p, 'delta_sei_upper', None)
         if lower is None and upper is None:
             return
         scale = max(float(self.delta_sei_scale.detach().cpu()), 1e-30)
@@ -447,7 +463,7 @@ class SPMeModel(nn.Module):
         kap_p_eff = electrolyte_conductivity(cep_bar, self.p) * (self.p.epsilon_e_p ** self.p.brug)
         v_ohmic = (self.p.L_n / (2 * kap_n_eff) + self.p.L_s / kap_s_eff + self.p.L_p / (2 * kap_p_eff)) * current_flat
 
-        if self.cfg.get('use_electrolyte_activity', False):
+        if getattr(self.p, 'use_electrolyte_activity', False):
             dfca_n = electrolyte_activity(cen_bar, self.p)
             dfca_s = electrolyte_activity(ces_bar, self.p)
             dfca_p = electrolyte_activity(cep_bar, self.p)

@@ -78,6 +78,15 @@ disable_electrolyte_ohmic: false
 disable_electrolyte_concentration: false
 
 # Present only for compatibility with shared SPMe helpers; not used by method: nn.
+estimate_delta_sei: false
+nLi_s_fresh: 0.2840
+nLi_s_init: 0.2840
+nLi_e_init: 0.0053677182
+delta_sei_init: 0.0
+delta_sei_lower: 0.0
+delta_sei_upper: 2.0e-6
+delta_sei_true: 0.0
+epsilon_e_n_true: 0.25
 supervise_states: true
 w_state: 1.0
 w_v: 1.0

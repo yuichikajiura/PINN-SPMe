@@ -1,6 +1,4 @@
 import torch
-import train_pinn
-import train_nn
 import train_pinn_spme
 import numpy as np
 
@@ -43,24 +41,16 @@ if __name__ == '__main__':
     torch.manual_seed(cfg['seed'])  # PyTorch random number generator
     np.random.seed(cfg['seed'])  # Random number generators in other libraries
 
-    model_type = cfg.get('model_type', 'spm')
+    model_type = cfg.get('model_type', 'spme')
+    if model_type != 'spme':
+        raise ValueError("Only model_type: 'spme' is supported.")
 
     'Set battery parameters and loss weights'
-    if model_type == 'spme':
-        p = ip.InitParamsSPMe(cfg)
-    else:
-        p = ip.InitParams(cfg)
-        p.input_size = 2  # number of input for LSTM. [I, Vt]
-        p.output_size = cfg['n_r'] - 1  # number of outputs per NN
+    p = ip.InitParamsSPMe(cfg)
 
-    if model_type == 'spme':
-        if cfg['method'] == 'pinn':
-            train_pinn_spme.train(cfg, device, p)
-        elif cfg['method'] == 'nn':
-            train_pinn_spme.train_nn(cfg, device, p)
-        else:
-            raise ValueError("SPMe path supports method: 'nn' or 'pinn'.")
-    elif cfg['method'] == 'pinn':
-        train_pinn.train(cfg, device, p)
+    if cfg['method'] == 'pinn':
+        train_pinn_spme.train(cfg, device, p)
+    elif cfg['method'] == 'nn':
+        train_pinn_spme.train_nn(cfg, device, p)
     else:
-        train_nn.train(cfg, device, p)
+        raise ValueError("SPMe path supports method: 'nn' or 'pinn'.")

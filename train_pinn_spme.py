@@ -1,12 +1,12 @@
 import os
 import time
+from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
 
-import helper_func as hf
 import losses_spme
 from electrolyte_fvm import electrolyte_lithium_inventory, reconstruct_full_concentration
 from pinn_spme_network import create_spme_nn_models, predict_spme_state_raw
@@ -124,19 +124,112 @@ def _is_due_epoch(epoch_display, every):
     return every is not None and every > 0 and epoch_display % every == 0
 
 
-def _sync_if_cuda(device):
-    if torch.device(device).type == 'cuda':
+def sync_device(device):
+    device = torch.device(device)
+    if device.type == 'cuda':
         torch.cuda.synchronize(device)
+    elif device.type == 'mps' and hasattr(torch, 'mps'):
+        torch.mps.synchronize()
 
 
 def _timer_now(device):
-    _sync_if_cuda(device)
+    sync_device(device)
     return time.perf_counter()
 
 
 def _timer_add(timing, key, start, device):
-    _sync_if_cuda(device)
+    sync_device(device)
     timing[key] = timing.get(key, 0.0) + (time.perf_counter() - start)
+
+
+class TimingAccumulator:
+    def __init__(self, device, enabled=False):
+        self.device = torch.device(device)
+        self.enabled = bool(enabled)
+        self.times = {}
+
+    def _sync(self):
+        if self.enabled:
+            sync_device(self.device)
+
+    def section(self, key):
+        if not self.enabled:
+            return nullcontext()
+        return _TimingSection(self, key)
+
+    def add(self, key, elapsed):
+        if self.enabled:
+            self.times[key] = self.times.get(key, 0.0) + elapsed
+
+    def update(self, values):
+        if self.enabled:
+            for key, value in values.items():
+                if key.endswith('_sec'):
+                    key = key[:-4]
+                self.times[key] = self.times.get(key, 0.0) + float(value)
+
+    def payload(self):
+        keys = [
+            'data_loading',
+            'nn_forward',
+            'rollout',
+            'solid_update',
+            'electrolyte_update',
+            'loss_voltage',
+            'loss_li_s',
+            'loss_li_e',
+            'loss_integ',
+            'loss_assembly',
+            'backward',
+            'optimizer',
+            'batch_total',
+            'logging_eval',
+            'epoch_total',
+        ]
+        return {f'timing/{key}_s': self.times.get(key, 0.0) for key in keys}
+
+    def history_fields(self):
+        return {f'timing_{key}_s': value for key, value in self.times.items()}
+
+    def print_report(self, epoch_display):
+        total = self.times.get('epoch_total', 0.0)
+        print(f"Timing profile epoch {epoch_display}")
+        print(f"  total epoch: {total:.2f} s")
+        for key in [
+            'data_loading',
+            'nn_forward',
+            'rollout',
+            'solid_update',
+            'electrolyte_update',
+            'loss_voltage',
+            'loss_li_s',
+            'loss_li_e',
+            'loss_integ',
+            'loss_assembly',
+            'backward',
+            'optimizer',
+            'batch_total',
+            'logging_eval',
+        ]:
+            elapsed = self.times.get(key, 0.0)
+            pct = 100.0 * elapsed / total if total > 0 else 0.0
+            print(f"  {key:18s}{elapsed:9.2f} s {pct:6.1f}%")
+
+
+class _TimingSection:
+    def __init__(self, timer, key):
+        self.timer = timer
+        self.key = key
+        self.start = None
+
+    def __enter__(self):
+        self.timer._sync()
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.timer._sync()
+        self.timer.add(self.key, time.perf_counter() - self.start)
 
 
 def _average_chunks(sequence, h):
@@ -153,50 +246,6 @@ def _sample_chunks(sequence, h):
 def _sample_state_chunks(sequence, h):
     idx = torch.arange(h - 1, sequence.shape[1], h, device=sequence.device)
     return sequence.index_select(1, idx)
-
-
-def _simulate_spme_profile(current_profile, model, device):
-    dtype = torch.float32
-    x = model.initial_state(1, device=device, dtype=dtype)
-    n_steps = len(current_profile)
-    x_hist = torch.zeros(n_steps, model.p.state_dim, device=device, dtype=dtype)
-    vt_hist = torch.zeros(n_steps, device=device, dtype=dtype)
-
-    with torch.no_grad():
-        for idx in range(n_steps):
-            current = torch.tensor([[float(current_profile[idx])]], device=device, dtype=dtype)
-            x_hist[idx] = x.squeeze(0)
-            c_n, c_p = model.calc_css_and_cs0(x, current)
-            _, c_e, _ = model.unpack_state(x)
-            vt_hist[idx] = model.calc_voltage(c_n[:, -1], c_p[:, -1], c_e, current).squeeze()
-            x = model.step(x, current)
-
-    return x_hist.cpu().numpy(), vt_hist.cpu().numpy()
-
-
-def _build_synthetic_dataset(cfg, device, p):
-    base_model = SPMeModel(p, cfg).to(device)
-
-    train_data, train_lengths = hf.load_data_spmfdm(cfg['train_data_type'], cell=cfg.get('current_profile_cell', 1))
-    val_data, val_lengths = hf.load_data_spmfdm(cfg['val_data_type'], cell=cfg.get('current_profile_cell', 1))
-
-    x_train, vt_train = _simulate_spme_profile(train_data['Current(A)'].to_numpy(), base_model, device)
-    x_val, vt_val = _simulate_spme_profile(val_data['Current(A)'].to_numpy(), base_model, device)
-
-    return {
-        'train': {
-            'current': train_data['Current(A)'].to_numpy(),
-            'voltage': vt_train,
-            'state': x_train,
-            'lengths': train_lengths,
-        },
-        'val': {
-            'current': val_data['Current(A)'].to_numpy(),
-            'voltage': vt_val,
-            'state': x_val,
-            'lengths': val_lengths,
-        },
-    }
 
 
 def _resolve_data_files(files, data_dir):
@@ -239,13 +288,14 @@ def _load_spme_csv_dataset(files, p):
             time_values = df["Test_Time(s)"].to_numpy(dtype=np.float32)
         else:
             time_values = np.arange(len(df), dtype=np.float32)
-        profiles.append({
+        profile = {
             'name': os.path.basename(path),
             'time': time_values,
             'current': df["current_A"].to_numpy(dtype=np.float32),
             'voltage': df["voltage_V"].to_numpy(dtype=np.float32),
             'state': profile_state,
-        })
+        }
+        profiles.append(profile)
 
     if not frames:
         raise ValueError("No SPMe CSV datasets were provided.")
@@ -262,18 +312,17 @@ def _load_spme_csv_dataset(files, p):
 
 
 def _load_training_dataset(cfg, device, p):
-    if cfg.get("data_source", "csv") == "csv" or cfg.get("train_data_files"):
-        data_dir = cfg.get("data_dir", "data")
-        train_files = _resolve_data_files(cfg.get("train_data_files", []), data_dir)
-        val_files = _resolve_data_files(cfg.get("val_data_files", []), data_dir)
-        train = _load_spme_csv_dataset(train_files, p)
-        val = _load_spme_csv_dataset(val_files, p)
-        print("Loaded SPMe CSV datasets:")
-        print(f"  train files: {len(train_files)}, samples: {sum(train['lengths'])}")
-        print(f"  val files:   {len(val_files)}, samples: {sum(val['lengths'])}")
-        return {'train': train, 'val': val}
-
-    return _build_synthetic_dataset(cfg, device, p)
+    if cfg.get("data_source", "csv") != "csv" and not cfg.get("train_data_files"):
+        raise ValueError("Only CSV-backed SPMe datasets are supported.")
+    data_dir = cfg.get("data_dir", "data")
+    train_files = _resolve_data_files(cfg.get("train_data_files", []), data_dir)
+    val_files = _resolve_data_files(cfg.get("val_data_files", []), data_dir)
+    train = _load_spme_csv_dataset(train_files, p)
+    val = _load_spme_csv_dataset(val_files, p)
+    print("Loaded SPMe CSV datasets:")
+    print(f"  train files: {len(train_files)}, samples: {sum(train['lengths'])}")
+    print(f"  val files:   {len(val_files)}, samples: {sum(val['lengths'])}")
+    return {'train': train, 'val': val}
 
 
 def _prepare_dataset(split_data, cfg, p, device):
@@ -651,8 +700,8 @@ def _degradation_stats(model, cfg):
     nli_s = model.nLi_s_est.reshape(())
     nli_e = model.nLi_e_est.reshape(())
     r_f_n = model.R_f_n_est.reshape(())
-    delta_true = torch.as_tensor(cfg.get('delta_sei_true', float('nan')), dtype=delta.dtype, device=delta.device)
-    epsilon_true = torch.as_tensor(cfg.get('epsilon_e_n_true', float('nan')), dtype=epsilon.dtype, device=epsilon.device)
+    delta_true = torch.as_tensor(model.p.delta_sei_true, dtype=delta.dtype, device=delta.device)
+    epsilon_true = torch.as_tensor(model.p.epsilon_e_n_true, dtype=epsilon.dtype, device=epsilon.device)
     nli_sei_true = model.C_li_sei.to(dtype=delta.dtype, device=delta.device) * delta_true
     return {
         'delta_sei_est': delta,
@@ -667,6 +716,22 @@ def _degradation_stats(model, cfg):
         'nLi_s_est': nli_s,
         'nLi_e_est': nli_e,
         'R_f_n_est': r_f_n,
+    }
+
+
+def _true_degradation_for_plot(model, n_samples, ref):
+    dtype = ref.dtype
+    device = ref.device
+    delta = torch.as_tensor(model.p.delta_sei_true, dtype=dtype, device=device)
+    nli_sei = model.nLi_sei_from_delta(delta).to(dtype=dtype, device=device)
+    nli_s = model.nLi_s_from_sei_inventory(nli_sei).to(dtype=dtype, device=device)
+    nli_e = model.nLi_e_from_delta(delta).to(dtype=dtype, device=device)
+    return {
+        'dynamic': model.electrolyte_dynamic_from_delta(delta, ref),
+        'delta_sei': delta,
+        'nLi_sei': nli_sei.expand(n_samples),
+        'nLi_s': nli_s.expand(n_samples),
+        'nLi_e': nli_e.expand(n_samples),
     }
 
 
@@ -702,12 +767,7 @@ def _delta_sei_grad_diagnostics(model):
     return stats
 
 
-def _bare_nn_lithium_inventory_losses(model, x_nn_raw, p, eps=1e-12):
-    c_s_n_nn, c_e_nn, c_s_p_nn = model.unpack_state(x_nn_raw)
-    c_n_nn, c_p_nn = model.calc_css_and_cs0(x_nn_raw, torch.zeros(x_nn_raw.shape[0], 1, dtype=x_nn_raw.dtype, device=x_nn_raw.device))
-    n_li_s_nn = model.calc_solid_lithium(c_n_nn, c_p_nn)
-    n_li_e_nn = electrolyte_lithium_inventory(c_e_nn, p, model.electrolyte_dynamic(c_e_nn))
-
+def _bare_nn_lithium_inventory_losses(model, x_nn_raw, p, eps=1e-12, timer=None):
     if x_nn_raw.shape[0] == 0:
         zero = torch.zeros((), dtype=x_nn_raw.dtype, device=x_nn_raw.device)
         return zero, zero, {
@@ -723,12 +783,22 @@ def _bare_nn_lithium_inventory_losses(model, x_nn_raw, p, eps=1e-12):
             'nLi_e_rel_std': zero,
         }
 
-    loss_li_s, mean_s, std_s, est_s, rel_std_s = _relative_inventory_estimation_loss(
-        n_li_s_nn, model.nLi_s_est, model.nLi_s_init, eps
-    )
-    loss_li_e, mean_e, std_e, est_e, rel_std_e = _relative_inventory_estimation_loss(
-        n_li_e_nn, model.nLi_e_est, model.nLi_e_init, eps
-    )
+    timer = timer if timer is not None else TimingAccumulator(x_nn_raw.device, enabled=False)
+    with timer.section('loss_li_s'):
+        c_s_n_nn, c_e_nn, c_s_p_nn = model.unpack_state(x_nn_raw)
+        c_n_nn, c_p_nn = model.calc_css_and_cs0(
+            x_nn_raw,
+            torch.zeros(x_nn_raw.shape[0], 1, dtype=x_nn_raw.dtype, device=x_nn_raw.device),
+        )
+        n_li_s_nn = model.calc_solid_lithium(c_n_nn, c_p_nn)
+        loss_li_s, mean_s, std_s, est_s, rel_std_s = _relative_inventory_estimation_loss(
+            n_li_s_nn, model.nLi_s_est, model.nLi_s_init, eps
+        )
+    with timer.section('loss_li_e'):
+        n_li_e_nn = electrolyte_lithium_inventory(c_e_nn, p, model.electrolyte_dynamic(c_e_nn))
+        loss_li_e, mean_e, std_e, est_e, rel_std_e = _relative_inventory_estimation_loss(
+            n_li_e_nn, model.nLi_e_est, model.nLi_e_init, eps
+        )
     stats = {
         'nLi_s_mean': mean_s,
         'mean_pred_nLi_s': mean_s,
@@ -913,13 +983,16 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
         _, pred_c_e, _ = model.unpack_state(x_nn_raw)
         _, true_c_e, _ = model.unpack_state(target_raw)
         pred_dynamic = model.electrolyte_dynamic(pred_c_e)
-        true_dynamic = model.electrolyte_dynamic(true_c_e)
+        true_degradation = _true_degradation_for_plot(model, len(target_idx), true_c_e)
+        true_dynamic = true_degradation['dynamic']
         pred_c_ex = reconstruct_full_concentration(pred_c_e, model.p, pred_dynamic)
         true_c_ex = reconstruct_full_concentration(true_c_e, model.p, true_dynamic)
-        n_li_s_true = model.calc_solid_lithium(true_c_n, true_c_p)
+        n_li_s_true = true_degradation['nLi_s']
         n_li_s_pred = model.calc_solid_lithium(pred_c_n, pred_c_p)
-        n_li_e_true = electrolyte_lithium_inventory(true_c_e, model.p, true_dynamic)
+        n_li_e_true = true_degradation['nLi_e']
         n_li_e_pred = electrolyte_lithium_inventory(pred_c_e, model.p, pred_dynamic)
+        n_li_sei_true = true_degradation['nLi_sei']
+        n_li_sei_pred = model.nLi_sei_est.to(dtype=true_c_e.dtype, device=true_c_e.device).reshape(()).expand(len(target_idx))
         components_pred = model.calc_voltage_components(
             pred_c_n[:, -1],
             pred_c_p[:, -1],
@@ -1001,7 +1074,7 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
             v_roll[valid_v_roll] = v_roll_sum[valid_v_roll] / v_roll_count[valid_v_roll]
 
         roll_c_n = roll_c_p = roll_c_ex = components_roll = None
-        n_li_s_roll = n_li_e_roll = None
+        n_li_s_roll = n_li_e_roll = n_li_sei_roll = None
         valid_roll_state = torch.isfinite(x_roll_raw).all(dim=1)
         if valid_roll_state.any():
             i_roll_target = i_target[valid_roll_state]
@@ -1024,11 +1097,13 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
             roll_c_ex = torch.full_like(pred_c_ex, float('nan'))
             n_li_s_roll = torch.full_like(n_li_s_pred, float('nan'))
             n_li_e_roll = torch.full_like(n_li_e_pred, float('nan'))
+            n_li_sei_roll = torch.full_like(n_li_sei_pred, float('nan'))
             roll_c_n[valid_roll_state] = roll_c_n_valid
             roll_c_p[valid_roll_state] = roll_c_p_valid
             roll_c_ex[valid_roll_state] = roll_c_ex_valid
             n_li_s_roll[valid_roll_state] = n_li_s_roll_valid
             n_li_e_roll[valid_roll_state] = n_li_e_roll_valid
+            n_li_sei_roll[valid_roll_state] = n_li_sei_pred[valid_roll_state]
             components_roll = {}
             for name, value in components_pred.items():
                 filled = torch.full_like(value.reshape_as(v_target), float('nan'))
@@ -1047,6 +1122,9 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
         'n_li_e_true': n_li_e_true.detach().cpu().numpy().reshape(-1),
         'n_li_e_pred': n_li_e_pred.detach().cpu().numpy().reshape(-1),
         'n_li_e_roll': None if n_li_e_roll is None else n_li_e_roll.detach().cpu().numpy().reshape(-1),
+        'n_li_sei_true': n_li_sei_true.detach().cpu().numpy().reshape(-1),
+        'n_li_sei_pred': n_li_sei_pred.detach().cpu().numpy().reshape(-1),
+        'n_li_sei_roll': None if n_li_sei_roll is None else n_li_sei_roll.detach().cpu().numpy().reshape(-1),
         'components_true': {name: value.detach().cpu().numpy().reshape(-1) for name, value in components_true.items()},
         'components_pred': {name: value.detach().cpu().numpy().reshape(-1) for name, value in components_pred.items()},
         'components_roll': None if components_roll is None else {
@@ -1082,6 +1160,10 @@ def _log_profile_predictions(run, nn_models, model, datasets, epoch, cfg):
     def plot_pair(ax, x, true_y, pred_y, label, color_idx):
         actual_color = actual_colors[color_idx % len(actual_colors)]
         pred_color = pred_colors[color_idx % len(pred_colors)]
+        ax.plot(x, true_y, linestyle=':', linewidth=1.8, color=actual_color, label=f'{label} actual')
+        ax.plot(x, pred_y, linestyle='--', linewidth=1.5, color=pred_color, label=f'predicted {label}')
+
+    def plot_pair_with_colors(ax, x, true_y, pred_y, label, actual_color, pred_color):
         ax.plot(x, true_y, linestyle=':', linewidth=1.8, color=actual_color, label=f'{label} actual')
         ax.plot(x, pred_y, linestyle='--', linewidth=1.5, color=pred_color, label=f'predicted {label}')
 
@@ -1157,48 +1239,82 @@ def _log_profile_predictions(run, nn_models, model, datasets, epoch, cfg):
                 log_data[f'{split_name}/{profile_key}/spatial_profiles_{kind}'] = wandb.Image(fig)
                 plt.close(fig)
 
-            def plot_time_series(kind, c_n_key, c_ex_key, c_p_key, v_key, n_li_s_key, n_li_e_key, mask):
+            def plot_time_series(kind, c_n_key, c_ex_key, c_p_key, v_key, n_li_s_key, n_li_e_key, n_li_sei_key, mask):
                 if not np.any(mask):
                     return
+                def draw_time_series(axes, local_mask, x_label=False):
+                    t_plot = t[local_mask]
+                    for color_idx, (label, idx) in enumerate(solid_locs.items()):
+                        plot_pair(axes[0], t_plot, result['c_n_true'][local_mask, idx], result[c_n_key][local_mask, idx], label, color_idx)
+                        plot_pair(axes[1], t_plot, result['c_p_true'][local_mask, idx], result[c_p_key][local_mask, idx], label, color_idx)
+                    for color_idx, (label, idx) in enumerate(e_locs_n.items()):
+                        plot_pair(axes[2], t_plot, result['c_ex_true'][local_mask, idx], result[c_ex_key][local_mask, idx], label, color_idx)
+                    for color_idx, (label, idx) in enumerate(e_locs_s.items()):
+                        plot_pair(axes[3], t_plot, result['c_ex_true'][local_mask, idx], result[c_ex_key][local_mask, idx], label, color_idx)
+                    for color_idx, (label, idx) in enumerate(e_locs_p.items()):
+                        plot_pair(axes[4], t_plot, result['c_ex_true'][local_mask, idx], result[c_ex_key][local_mask, idx], label, color_idx)
+                    plot_pair(axes[5], t_plot, result['v_true'][local_mask], result[v_key][local_mask], 'voltage', 0)
+                    axes[6].plot(
+                        t_plot, result[v_key][local_mask] - result['v_true'][local_mask],
+                        linestyle='--', linewidth=1.5, color=pred_colors[1], label=f'predicted {kind} error'
+                    )
+                    plot_pair(axes[7], t_plot, result['n_li_s_true'][local_mask], result[n_li_s_key][local_mask], 'solid Li inventory', 2)
+                    plot_pair(axes[8], t_plot, result['n_li_e_true'][local_mask], result[n_li_e_key][local_mask], 'electrolyte Li inventory', 3)
+                    plot_pair(axes[9], t_plot, result['n_li_sei_true'][local_mask], result[n_li_sei_key][local_mask], 'SEI Li inventory', 4)
+                    labels = ['c_s_n', 'c_s_p', 'c_e neg', 'c_e sep', 'c_e pos', 'V', 'V error', 'nLi solid', 'nLi electrolyte', 'nLi SEI']
+                    for row_idx, ax in enumerate(axes):
+                        ax.set_ylabel(labels[row_idx])
+                        ax.grid(True, alpha=0.25)
+                        ax.legend(loc='best', ncol=2)
+                    if x_label:
+                        axes[-1].set_xlabel('time [s]')
+
                 t_plot = t[mask]
-                fig, axes = plt.subplots(9, 1, figsize=(12, 22), sharex=True)
-                for color_idx, (label, idx) in enumerate(solid_locs.items()):
-                    plot_pair(axes[0], t_plot, result['c_n_true'][mask, idx], result[c_n_key][mask, idx], label, color_idx)
-                    plot_pair(axes[1], t_plot, result['c_p_true'][mask, idx], result[c_p_key][mask, idx], label, color_idx)
-                for color_idx, (label, idx) in enumerate(e_locs_n.items()):
-                    plot_pair(axes[2], t_plot, result['c_ex_true'][mask, idx], result[c_ex_key][mask, idx], label, color_idx)
-                for color_idx, (label, idx) in enumerate(e_locs_s.items()):
-                    plot_pair(axes[3], t_plot, result['c_ex_true'][mask, idx], result[c_ex_key][mask, idx], label, color_idx)
-                for color_idx, (label, idx) in enumerate(e_locs_p.items()):
-                    plot_pair(axes[4], t_plot, result['c_ex_true'][mask, idx], result[c_ex_key][mask, idx], label, color_idx)
-                plot_pair(axes[5], t_plot, result['v_true'][mask], result[v_key][mask], 'voltage', 0)
-                axes[6].plot(
-                    t_plot, result[v_key][mask] - result['v_true'][mask],
-                    linestyle='--', linewidth=1.5, color=pred_colors[1], label=f'predicted {kind} error'
-                )
-                plot_pair(axes[7], t_plot, result['n_li_s_true'][mask], result[n_li_s_key][mask], 'solid Li inventory', 2)
-                plot_pair(axes[8], t_plot, result['n_li_e_true'][mask], result[n_li_e_key][mask], 'electrolyte Li inventory', 3)
-                axes[0].set_ylabel('c_s_n')
-                axes[1].set_ylabel('c_s_p')
-                axes[2].set_ylabel('c_e neg')
-                axes[3].set_ylabel('c_e sep')
-                axes[4].set_ylabel('c_e pos')
-                axes[5].set_ylabel('V')
-                axes[6].set_ylabel('V error')
-                axes[7].set_ylabel('nLi solid')
-                axes[8].set_ylabel('nLi electrolyte')
-                axes[8].set_xlabel('time [s]')
-                for ax in axes:
-                    ax.grid(True, alpha=0.25)
-                    ax.legend(loc='best', ncol=2)
+                fig, axes = plt.subplots(10, 1, figsize=(12, 24), sharex=True)
+                draw_time_series(axes, mask, x_label=True)
                 fig.tight_layout()
                 log_data[f'{split_name}/{profile_key}/time_series_{kind}'] = wandb.Image(fig)
+                plt.close(fig)
+
+                first_mask = mask & (t <= t_plot[0] + 500.0)
+                last_mask = mask & (t >= t_plot[-1] - 500.0)
+                fig, axes = plt.subplots(10, 2, figsize=(18, 24), sharex='col', squeeze=False)
+                if np.any(first_mask):
+                    draw_time_series(axes[:, 0], first_mask, x_label=True)
+                    axes[0, 0].set_title('first 500 s')
+                if np.any(last_mask):
+                    draw_time_series(axes[:, 1], last_mask, x_label=True)
+                    axes[0, 1].set_title('last 500 s')
+                fig.tight_layout()
+                log_data[f'{split_name}/{profile_key}/time_series_edges_{kind}'] = wandb.Image(fig)
                 plt.close(fig)
 
             def plot_voltage_components(kind, components_key, mask):
                 components = result[components_key]
                 if components is None or not np.any(mask):
                     return
+
+                def draw_voltage_components(axes, local_mask, x_label=False):
+                    t_plot = t[local_mask]
+                    for row_idx, (ax, (key, label)) in enumerate(zip(axes, rows)):
+                        if key == 'film_drop':
+                            plot_pair_with_colors(
+                                ax,
+                                t_plot,
+                                true_components[key][local_mask],
+                                components[key][local_mask],
+                                label,
+                                actual_color='#000000',
+                                pred_color='#d62728',
+                            )
+                        else:
+                            plot_pair(ax, t_plot, true_components[key][local_mask], components[key][local_mask], label, row_idx)
+                        ax.set_ylabel(label)
+                        ax.grid(True, alpha=0.25)
+                        ax.legend(loc='best')
+                    if x_label:
+                        axes[-1].set_xlabel('time [s]')
+
                 t_plot = t[mask]
                 true_components = result['components_true']
                 rows = [
@@ -1211,19 +1327,27 @@ def _log_profile_predictions(run, nn_models, model, datasets, epoch, cfg):
                     ('film_drop', 'film drop'),
                 ]
                 fig, axes = plt.subplots(len(rows), 1, figsize=(12, 18), sharex=True)
-                for row_idx, (ax, (key, label)) in enumerate(zip(axes, rows)):
-                    plot_pair(ax, t_plot, true_components[key][mask], components[key][mask], label, row_idx)
-                    ax.set_ylabel(label)
-                    ax.grid(True, alpha=0.25)
-                    ax.legend(loc='best')
-                axes[-1].set_xlabel('time [s]')
+                draw_voltage_components(axes, mask, x_label=True)
                 fig.tight_layout()
                 log_data[f'{split_name}/{profile_key}/voltage_components_{kind}'] = wandb.Image(fig)
                 plt.close(fig)
 
+                first_mask = mask & (t <= t_plot[0] + 500.0)
+                last_mask = mask & (t >= t_plot[-1] - 500.0)
+                fig, axes = plt.subplots(len(rows), 2, figsize=(18, 18), sharex='col', squeeze=False)
+                if np.any(first_mask):
+                    draw_voltage_components(axes[:, 0], first_mask, x_label=True)
+                    axes[0, 0].set_title('first 500 s')
+                if np.any(last_mask):
+                    draw_voltage_components(axes[:, 1], last_mask, x_label=True)
+                    axes[0, 1].set_title('last 500 s')
+                fig.tight_layout()
+                log_data[f'{split_name}/{profile_key}/voltage_components_edges_{kind}'] = wandb.Image(fig)
+                plt.close(fig)
+
             bare_mask = np.ones(len(result['time']), dtype=bool)
             plot_spatial('bare_nn', 'c_n_pred', 'c_ex_pred', 'c_p_pred', sample_idx)
-            plot_time_series('bare_nn', 'c_n_pred', 'c_ex_pred', 'c_p_pred', 'v_pred', 'n_li_s_pred', 'n_li_e_pred', bare_mask)
+            plot_time_series('bare_nn', 'c_n_pred', 'c_ex_pred', 'c_p_pred', 'v_pred', 'n_li_s_pred', 'n_li_e_pred', 'n_li_sei_pred', bare_mask)
             plot_voltage_components('bare_nn', 'components_pred', bare_mask)
 
             if result['c_n_roll'] is not None:
@@ -1234,6 +1358,7 @@ def _log_profile_predictions(run, nn_models, model, datasets, epoch, cfg):
                     & np.isfinite(result['v_roll'])
                     & np.isfinite(result['n_li_s_roll'])
                     & np.isfinite(result['n_li_e_roll'])
+                    & np.isfinite(result['n_li_sei_roll'])
                 )
             else:
                 roll_mask = np.zeros(len(result['time']), dtype=bool)
@@ -1242,7 +1367,7 @@ def _log_profile_predictions(run, nn_models, model, datasets, epoch, cfg):
                 roll_count = min(n_samples, len(roll_indices_all))
                 roll_sample_idx = roll_indices_all[np.linspace(0, len(roll_indices_all) - 1, roll_count, dtype=int)]
                 plot_spatial('rolled_spme', 'c_n_roll', 'c_ex_roll', 'c_p_roll', roll_sample_idx)
-                plot_time_series('rolled_spme', 'c_n_roll', 'c_ex_roll', 'c_p_roll', 'v_roll', 'n_li_s_roll', 'n_li_e_roll', roll_mask)
+                plot_time_series('rolled_spme', 'c_n_roll', 'c_ex_roll', 'c_p_roll', 'v_roll', 'n_li_s_roll', 'n_li_e_roll', 'n_li_sei_roll', roll_mask)
                 plot_voltage_components('rolled_spme', 'components_roll', roll_mask)
 
     if log_data:
@@ -1454,6 +1579,7 @@ def train(cfg, device, p):
     profile_timing = bool(cfg.get('profile_timing', False))
     profile_timing_every = int(cfg.get('profile_timing_every', 20))
     profile_timing_warmup_epochs = int(cfg.get('profile_timing_warmup_epochs', 5))
+    profile_timing_log_wandb = bool(cfg.get('profile_timing_log_wandb', True))
     val_eval_subset = _validation_eval_subset(val_data, cfg)
     start_epoch, best_val, history = _resume_from_checkpoint(cfg, nn_models, optimizers, device, model=model)
     if start_epoch == 0:
@@ -1478,130 +1604,117 @@ def train(cfg, device, p):
         for epoch in range(start_epoch, cfg['epochs']):
             epoch_display = epoch + 1
             timing_enabled = profile_timing and epoch_display > profile_timing_warmup_epochs
-            timing = {
-                'data_batch_prep_sec': 0.0,
-                'nn_forward_sec': 0.0,
-                'rollout_total_sec': 0.0,
-                'voltage_sec': 0.0,
-                'loss_calc_sec': 0.0,
-                'backward_sec': 0.0,
-                'optimizer_step_sec': 0.0,
-                'logging_eval_sec': 0.0,
-            }
+            timer = TimingAccumulator(device, enabled=timing_enabled)
             model.reset_timing(enabled=timing_enabled)
-            epoch_loss = 0.0
-            epoch_loss_v = 0.0
-            epoch_loss_li_s = 0.0
-            epoch_loss_li_e = 0.0
-            epoch_loss_integ = 0.0
-            epoch_loss_integ_n = 0.0
-            epoch_loss_integ_e = 0.0
-            epoch_loss_integ_p = 0.0
-            epoch_nli_s_mean = 0.0
-            epoch_nli_s_std = 0.0
-            epoch_nli_s_rel_std = 0.0
-            epoch_nli_e_mean = 0.0
-            epoch_nli_e_std = 0.0
-            epoch_nli_e_rel_std = 0.0
-            delta_sei_grad_debug_stats = None
-            delta_sei_grad_debug_done = False
+            with timer.section('epoch_total'):
+                epoch_loss = 0.0
+                epoch_loss_v = 0.0
+                epoch_loss_li_s = 0.0
+                epoch_loss_li_e = 0.0
+                epoch_loss_integ = 0.0
+                epoch_loss_integ_n = 0.0
+                epoch_loss_integ_e = 0.0
+                epoch_loss_integ_p = 0.0
+                epoch_nli_s_mean = 0.0
+                epoch_nli_s_std = 0.0
+                epoch_nli_s_rel_std = 0.0
+                epoch_nli_e_mean = 0.0
+                epoch_nli_e_std = 0.0
+                epoch_nli_e_rel_std = 0.0
+                delta_sei_grad_debug_stats = None
+                delta_sei_grad_debug_done = False
 
-            for batch_slice in _iter_ordered_profile_batches(
-                train_data,
-                batch_size,
-                shuffle_profiles=cfg.get('shuffle_pinn_profiles', True),
-                seed=cfg.get('seed', 0),
-                epoch=epoch,
-            ):
-                t_section = _timer_now(device) if timing_enabled else None
-                u_batch = train_data['u'][batch_slice]
-                i_future_ave_batch = train_data['i_future_ave'][batch_slice]
-                i_future_sampled_batch = train_data['i_future_sampled'][batch_slice]
-                v_target_batch = train_data['v_future_sampled'][batch_slice]
-                if timing_enabled:
-                    _timer_add(timing, 'data_batch_prep_sec', t_section, device)
+                for batch_slice in _iter_ordered_profile_batches(
+                    train_data,
+                    batch_size,
+                    shuffle_profiles=cfg.get('shuffle_pinn_profiles', True),
+                    seed=cfg.get('seed', 0),
+                    epoch=epoch,
+                ):
+                    with timer.section('batch_total'):
+                        with timer.section('data_loading'):
+                            u_batch = train_data['u'][batch_slice]
+                            i_future_ave_batch = train_data['i_future_ave'][batch_slice]
+                            i_future_sampled_batch = train_data['i_future_sampled'][batch_slice]
+                            v_target_batch = train_data['v_future_sampled'][batch_slice]
 
-                t_section = _timer_now(device) if timing_enabled else None
-                x0_raw = predict_spme_state_raw(nn_models, u_batch)
-                if timing_enabled:
-                    _timer_add(timing, 'nn_forward_sec', t_section, device)
+                        with timer.section('nn_forward'):
+                            x0_raw = predict_spme_state_raw(nn_models, u_batch)
 
-                # SPMe physics expects raw concentration units.
-                t_section = _timer_now(device) if timing_enabled else None
-                x_roll_future = model(x0_raw, i_future_ave_batch)
-                x_roll_raw = torch.cat([x0_raw.unsqueeze(-1), x_roll_future], dim=-1)
-                if timing_enabled:
-                    _timer_add(timing, 'rollout_total_sec', t_section, device)
+                        # SPMe physics expects raw concentration units.
+                        with timer.section('rollout'):
+                            x_roll_future = model(x0_raw, i_future_ave_batch)
+                            x_roll_raw = torch.cat([x0_raw.unsqueeze(-1), x_roll_future], dim=-1)
 
-                t_section = _timer_now(device) if timing_enabled else None
-                c_s_n_seq, c_e_seq, c_s_p_seq = model.unpack_state(x_roll_raw)
-                c_n_seq, c_p_seq = model.calc_css_and_cs0_seq(x_roll_raw, i_future_sampled_batch)
-                vt_pred = model.calc_voltage(c_n_seq[:, -1, :], c_p_seq[:, -1, :], c_e_seq, i_future_sampled_batch,
-                                             disable_electrolyte_ohmic=cfg.get('disable_electrolyte_ohmic', False),
-                                             disable_electrolyte_concentration=cfg.get('disable_electrolyte_concentration', False))
-                if timing_enabled:
-                    _timer_add(timing, 'voltage_sec', t_section, device)
+                        with timer.section('loss_voltage'):
+                            c_s_n_seq, c_e_seq, c_s_p_seq = model.unpack_state(x_roll_raw)
+                            c_n_seq, c_p_seq = model.calc_css_and_cs0_seq(x_roll_raw, i_future_sampled_batch)
+                            vt_pred = model.calc_voltage(
+                                c_n_seq[:, -1, :],
+                                c_p_seq[:, -1, :],
+                                c_e_seq,
+                                i_future_sampled_batch,
+                                disable_electrolyte_ohmic=cfg.get('disable_electrolyte_ohmic', False),
+                                disable_electrolyte_concentration=cfg.get('disable_electrolyte_concentration', False),
+                            )
+                            loss_v = losses_spme.voltage_loss(vt_pred, v_target_batch)
 
-                t_section = _timer_now(device) if timing_enabled else None
-                loss_v = losses_spme.voltage_loss(vt_pred, v_target_batch)
-                loss_li_s, loss_li_e, li_stats = _bare_nn_lithium_inventory_losses(model, x0_raw, p)
-                w_integ = cfg.get('w_integ', 1.0)
-                if w_integ:
-                    loss_integ, integ_stats = _integration_consistency_loss_from_predictions(
-                        model,
-                        x_roll_raw,
-                        x0_raw,
-                        p,
-                        int(train_data.get('window_stride', cfg.get('train_window_stride', 1))),
-                        int(train_data.get('pinn_rollout_steps', x_roll_raw.shape[-1] - 1)),
-                    )
-                else:
-                    loss_integ = torch.zeros((), dtype=x_roll_raw.dtype, device=x_roll_raw.device)
-                    integ_stats = {'loss_integ_n': loss_integ, 'loss_integ_e': loss_integ, 'loss_integ_p': loss_integ}
+                        loss_li_s, loss_li_e, li_stats = _bare_nn_lithium_inventory_losses(
+                            model, x0_raw, p, timer=timer
+                        )
+                        w_integ = cfg.get('w_integ', 1.0)
+                        with timer.section('loss_integ'):
+                            if w_integ:
+                                loss_integ, integ_stats = _integration_consistency_loss_from_predictions(
+                                    model,
+                                    x_roll_raw,
+                                    x0_raw,
+                                    p,
+                                    int(train_data.get('window_stride', cfg.get('train_window_stride', 1))),
+                                    int(train_data.get('pinn_rollout_steps', x_roll_raw.shape[-1] - 1)),
+                                )
+                            else:
+                                loss_integ = torch.zeros((), dtype=x_roll_raw.dtype, device=x_roll_raw.device)
+                                integ_stats = {'loss_integ_n': loss_integ, 'loss_integ_e': loss_integ, 'loss_integ_p': loss_integ}
 
-                loss = (cfg['w_v'] * loss_v + cfg['w_li_s'] * loss_li_s + cfg['w_li_e'] * loss_li_e
-                        + w_integ * loss_integ)
-                if timing_enabled:
-                    _timer_add(timing, 'loss_calc_sec', t_section, device)
+                        with timer.section('loss_assembly'):
+                            loss = (cfg['w_v'] * loss_v + cfg['w_li_s'] * loss_li_s + cfg['w_li_e'] * loss_li_e
+                                    + w_integ * loss_integ)
 
-                for optimizer in optimizers:
-                    optimizer.zero_grad()
-                t_section = _timer_now(device) if timing_enabled else None
-                loss.backward()
-                if timing_enabled:
-                    _timer_add(timing, 'backward_sec', t_section, device)
-                if (cfg.get('estimate_delta_sei', False)
-                        and cfg.get('debug_delta_sei_grad', False)
-                        and _is_due_epoch(epoch_display, int(cfg.get('debug_delta_sei_grad_every', 20)))
-                        and not delta_sei_grad_debug_done):
-                    delta_sei_grad_debug_stats = _delta_sei_grad_diagnostics(model)
-                    delta_sei_grad_debug_done = True
-                t_section = _timer_now(device) if timing_enabled else None
-                for optimizer in optimizers:
-                    optimizer.step()
-                model.clamp_inventory_parameters()
-                if timing_enabled:
-                    _timer_add(timing, 'optimizer_step_sec', t_section, device)
+                        for optimizer in optimizers:
+                            optimizer.zero_grad()
+                        with timer.section('backward'):
+                            loss.backward()
+                        if (cfg.get('estimate_delta_sei', False)
+                                and cfg.get('debug_delta_sei_grad', False)
+                                and _is_due_epoch(epoch_display, int(cfg.get('debug_delta_sei_grad_every', 20)))
+                                and not delta_sei_grad_debug_done):
+                            delta_sei_grad_debug_stats = _delta_sei_grad_diagnostics(model)
+                            delta_sei_grad_debug_done = True
+                        with timer.section('optimizer'):
+                            for optimizer in optimizers:
+                                optimizer.step()
+                            model.clamp_inventory_parameters()
 
-                epoch_loss += loss.item() * u_batch.shape[0]
-                epoch_loss_v += loss_v.item() * u_batch.shape[0]
-                epoch_loss_li_s += loss_li_s.item() * u_batch.shape[0]
-                epoch_loss_li_e += loss_li_e.item() * u_batch.shape[0]
-                epoch_loss_integ += loss_integ.item() * u_batch.shape[0]
-                epoch_loss_integ_n += integ_stats['loss_integ_n'].item() * u_batch.shape[0]
-                epoch_loss_integ_e += integ_stats['loss_integ_e'].item() * u_batch.shape[0]
-                epoch_loss_integ_p += integ_stats['loss_integ_p'].item() * u_batch.shape[0]
-                epoch_nli_s_mean += li_stats['nLi_s_mean'].item() * u_batch.shape[0]
-                epoch_nli_s_std += li_stats['std_pred_nLi_s'].item() * u_batch.shape[0]
-                epoch_nli_s_rel_std += li_stats['nLi_s_rel_std'].item() * u_batch.shape[0]
-                epoch_nli_e_mean += li_stats['nLi_e_mean'].item() * u_batch.shape[0]
-                epoch_nli_e_std += li_stats['std_pred_nLi_e'].item() * u_batch.shape[0]
-                epoch_nli_e_rel_std += li_stats['nLi_e_rel_std'].item() * u_batch.shape[0]
+                        epoch_loss += loss.item() * u_batch.shape[0]
+                        epoch_loss_v += loss_v.item() * u_batch.shape[0]
+                        epoch_loss_li_s += loss_li_s.item() * u_batch.shape[0]
+                        epoch_loss_li_e += loss_li_e.item() * u_batch.shape[0]
+                        epoch_loss_integ += loss_integ.item() * u_batch.shape[0]
+                        epoch_loss_integ_n += integ_stats['loss_integ_n'].item() * u_batch.shape[0]
+                        epoch_loss_integ_e += integ_stats['loss_integ_e'].item() * u_batch.shape[0]
+                        epoch_loss_integ_p += integ_stats['loss_integ_p'].item() * u_batch.shape[0]
+                        epoch_nli_s_mean += li_stats['nLi_s_mean'].item() * u_batch.shape[0]
+                        epoch_nli_s_std += li_stats['std_pred_nLi_s'].item() * u_batch.shape[0]
+                        epoch_nli_s_rel_std += li_stats['nLi_s_rel_std'].item() * u_batch.shape[0]
+                        epoch_nli_e_mean += li_stats['nLi_e_mean'].item() * u_batch.shape[0]
+                        epoch_nli_e_std += li_stats['std_pred_nLi_e'].item() * u_batch.shape[0]
+                        epoch_nli_e_rel_std += li_stats['nLi_e_rel_std'].item() * u_batch.shape[0]
 
-            if epoch >= cfg['decay_step']:
-                for optimizer in optimizers:
-                    for group in optimizer.param_groups:
-                        group['lr'] *= cfg['decay_rate']
+                if epoch >= cfg['decay_step']:
+                    for optimizer in optimizers:
+                        for group in optimizer.param_groups:
+                            group['lr'] *= cfg['decay_rate']
 
             epoch_loss /= n_samples
             epoch_loss_v /= n_samples
@@ -1680,10 +1793,11 @@ def train(cfg, device, p):
             if len(optimizers) > 3:
                 log_payload['learning_rate_sei'] = optimizers[3].param_groups[0]['lr']
 
-            t_logging = _timer_now(device) if timing_enabled else None
             metrics_val_subset = None
-            if _is_due_epoch(epoch_display, eval_every):
-                metrics_val_subset = _evaluate(nn_models, model, val_eval_subset, cfg, p)
+            with timer.section('logging_eval'):
+                if _is_due_epoch(epoch_display, eval_every):
+                    metrics_val_subset = _evaluate(nn_models, model, val_eval_subset, cfg, p)
+            if metrics_val_subset is not None:
                 history_row.update({
                     'val_subset_loss': metrics_val_subset['loss'],
                     'val_subset_loss_v': metrics_val_subset['loss_v'],
@@ -1738,9 +1852,11 @@ def train(cfg, device, p):
                 })
 
             metrics_train_full = metrics_val_full = None
-            if _is_due_epoch(epoch_display, full_eval_every):
-                metrics_train_full = _evaluate(nn_models, model, train_data, cfg, p)
-                metrics_val_full = _evaluate(nn_models, model, val_data, cfg, p)
+            with timer.section('logging_eval'):
+                if _is_due_epoch(epoch_display, full_eval_every):
+                    metrics_train_full = _evaluate(nn_models, model, train_data, cfg, p)
+                    metrics_val_full = _evaluate(nn_models, model, val_data, cfg, p)
+            if metrics_train_full is not None:
                 history_row.update({
                     'train_full_loss': metrics_train_full['loss'],
                     'train_full_loss_v': metrics_train_full['loss_v'],
@@ -1842,6 +1958,12 @@ def train(cfg, device, p):
                                 'nLi_sei_est', 'nLi_sei_true', 'R_f_n_est')
                 })
 
+            if timing_enabled:
+                timer.update(model.timing_summary())
+                timing_payload = timer.payload()
+                history_row.update(timer.history_fields())
+                log_payload.update(timing_payload)
+
             history.append(history_row)
 
             if epoch_display == 1 or _is_due_epoch(epoch_display, int(cfg.get('print_every', 50))):
@@ -1862,35 +1984,10 @@ def train(cfg, device, p):
                     _log_profile_predictions(run, nn_models, model, {'train': train_data, 'val': val_data}, epoch_display, cfg)
                 _log_degradation_history_plot(run, history, epoch_display, cfg)
 
-            if timing_enabled:
-                _timer_add(timing, 'logging_eval_sec', t_logging, device)
-                timing.update(model.timing_summary())
-                timing_payload = {
-                    'timing/data_batch_prep_sec': timing.get('data_batch_prep_sec', 0.0),
-                    'timing/nn_forward_sec': timing.get('nn_forward_sec', 0.0),
-                    'timing/rollout_total_sec': timing.get('rollout_total_sec', 0.0),
-                    'timing/solid_update_sec': timing.get('solid_update_sec', 0.0),
-                    'timing/electrolyte_update_sec': timing.get('electrolyte_update_sec', 0.0),
-                    'timing/voltage_sec': timing.get('voltage_sec', 0.0),
-                    'timing/loss_calc_sec': timing.get('loss_calc_sec', 0.0),
-                    'timing/backward_sec': timing.get('backward_sec', 0.0),
-                    'timing/optimizer_step_sec': timing.get('optimizer_step_sec', 0.0),
-                    'timing/logging_eval_sec': timing.get('logging_eval_sec', 0.0),
-                }
-                if _is_due_epoch(epoch_display, profile_timing_every):
-                    print(f"[timing epoch {epoch_display}]")
-                    print(f"  data_batch_prep: {timing_payload['timing/data_batch_prep_sec']:.2f} s")
-                    print(f"  nn_forward: {timing_payload['timing/nn_forward_sec']:.2f} s")
-                    print(f"  rollout_total: {timing_payload['timing/rollout_total_sec']:.2f} s")
-                    print(f"    solid_update: {timing_payload['timing/solid_update_sec']:.2f} s")
-                    print(f"    electrolyte_update: {timing_payload['timing/electrolyte_update_sec']:.2f} s")
-                    print(f"    voltage: {timing_payload['timing/voltage_sec']:.2f} s")
-                    print(f"  loss_calc: {timing_payload['timing/loss_calc_sec']:.2f} s")
-                    print(f"  backward: {timing_payload['timing/backward_sec']:.2f} s")
-                    print(f"  optimizer_step: {timing_payload['timing/optimizer_step_sec']:.2f} s")
-                    print(f"  logging_eval: {timing_payload['timing/logging_eval_sec']:.2f} s")
-                    if run is not None:
-                        run.log(timing_payload, step=epoch_display)
+            if timing_enabled and _is_due_epoch(epoch_display, profile_timing_every):
+                timer.print_report(epoch_display)
+                if run is not None and profile_timing_log_wandb:
+                    run.log(timing_payload, step=epoch_display)
 
             if metrics_val_full is not None and metrics_val_full['loss'] < best_val:
                 best_val = metrics_val_full['loss']

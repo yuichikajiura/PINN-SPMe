@@ -7,7 +7,7 @@ network_save_name: pinn_spme.pth
 history_save_name: pinn_spme_history.csv
 
 # Network
-batch_size: 256
+batch_size: 4096
 layer_lstm: 1
 layer_fc: 1
 hidden_lstm: 32
@@ -20,7 +20,7 @@ activation: tanh
 network_output: raw
 seed: 1234
 print_every: 20
-checkpoint_every: 1000
+checkpoint_every: 100
 keep_last_checkpoint: true
 save_optimizer_state: true
 resume_from_checkpoint:
@@ -58,8 +58,8 @@ test_data_files:
 # PINN batches preserve temporal order within each profile and only shuffle
 # profile order. Use stride 1 when enabling w_integ so neighboring-window
 # integration consistency matches the original SPM PINN algorithm.
-train_window_stride: 30
-val_window_stride: 30
+train_window_stride: 5
+val_window_stride: 5
 max_train_windows:
 max_val_windows:
 shuffle_pinn_profiles: true
@@ -85,7 +85,7 @@ disable_electrolyte_concentration: false
 # Core low-loss philosophy
 w_v: 1.0
 w_li_s: 1.0
-w_li_e: 0.0
+w_li_e: 1.0
 w_integ: 1.0
 estimate_nLi_s: false
 estimate_nLi_e: false
@@ -98,10 +98,6 @@ delta_sei_lower: 0.0
 delta_sei_upper: 2.0e-6
 delta_sei_true: 5.05188e-07
 epsilon_e_n_true: 0.0560283
-R_f_n_base: 0.0
-rho_sei: 1690.0
-M_sei: 0.162
-kappa_sei: 1.0e-6
 lrate_sei: 0.001
 
 # PINN follows the original SPM style: no true-state supervision loss and
@@ -110,8 +106,9 @@ supervise_states: false
 
 eval_every: 20
 full_eval_every: 100
-profile_timing: false
+profile_timing: true
 profile_timing_every: 20
 profile_timing_warmup_epochs: 5
+profile_timing_log_wandb: true
 debug_delta_sei_grad: false
 debug_delta_sei_grad_every: 20

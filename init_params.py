@@ -122,8 +122,21 @@ class InitParamsSPMe:
         # Derived interfacial areas
         self.a_s_n = 3 * self.epsilon_s_n / self.R_s_n
         self.a_s_p = 3 * self.epsilon_s_p / self.R_s_p
-        if cfg.get('estimate_delta_sei', False):
-            self.epsilon_e_n = self.epsilon_e_n - self.a_s_n * cfg.get('delta_sei_init', 0.0)
+        self.estimate_delta_sei = bool(cfg['estimate_delta_sei'])
+        self.delta_sei_init = float(cfg['delta_sei_init'])
+        self.delta_sei_lower = cfg['delta_sei_lower']
+        self.delta_sei_upper = cfg['delta_sei_upper']
+        self.delta_sei_scale = float(cfg.get('delta_sei_scale', cfg['delta_sei_upper']))
+        self.delta_sei_true = float(cfg['delta_sei_true'])
+        self.epsilon_e_n_true = float(cfg['epsilon_e_n_true'])
+        self.nLi_s_fresh = float(cfg['nLi_s_fresh'])
+        self.nLi_s_init = float(cfg['nLi_s_init'])
+        self.nLi_e_init_cfg = cfg['nLi_e_init']
+        self.epsilon_e_n_fresh = float(cfg.get('epsilon_e_n_fresh', self.epsilon_e_n))
+        self.R_f_n_base = 1e-3
+
+        if self.estimate_delta_sei:
+            self.epsilon_e_n = self.epsilon_e_n - self.a_s_n * self.delta_sei_init
             self.epsilon_f_n = 1 - self.epsilon_s_n - self.epsilon_e_n
 
         # Electrochemical parameters
@@ -136,23 +149,23 @@ class InitParamsSPMe:
         self.Faraday = 96485.33212
         self.R = 8.314472
         self.alph = 0.5
-        R_f_n_base = cfg.get('R_f_n_base', 1e-3)
-        if cfg.get('estimate_delta_sei', False):
-            R_f_n_base = R_f_n_base + cfg.get('delta_sei_init', 0.0) / cfg.get('kappa_sei', 1.0e-6)
-        self.R_f_n = R_f_n_base
         self.R_f_p = 0.0
         self.R_c = 0.0
-        self.rho_sei = cfg.get('rho_sei', 1690.0)
-        self.M_sei = cfg.get('M_sei', 0.162)
-        self.kappa_sei = cfg.get('kappa_sei', 1.0e-6)
+        self.rho_sei = 1690.0
+        self.M_sei = 0.162
+        self.kappa_sei = 5.0e-6
+        self.R_f_n = self.R_f_n_base
+        if self.estimate_delta_sei:
+            self.R_f_n = self.R_f_n_base + self.delta_sei_init / self.kappa_sei
         self.k_n0 = 6.48e-7
         self.k_p0 = 3.42e-6
         self.k_n = self.k_n0
         self.k_p = self.k_p0
 
         # Thermal / Arrhenius parameters
-        self.T_amb = cfg.get('temperature_K', 298.15)
+        self.T_amb = cfg['temperature_K']
         self.T_ref = 298.15
+        self.use_electrolyte_activity = bool(cfg['use_electrolyte_activity'])
         self.E_kn = 35e3
         self.E_kp = 17800
         self.E_Dsn = 3.03e4
@@ -176,21 +189,21 @@ class InitParamsSPMe:
         self.c_p_max = self.c_p_soc0
         self.c_e = 1e3
         self.c_e0 = self.c_e
-        self.ce_min = cfg.get('ce_min', 2.0e2)
-        self.ce_max = cfg.get('ce_max', 2.0e3)
+        self.ce_min = cfg['ce_min']
+        self.ce_max = cfg['ce_max']
         self.n_Li_s = 0.2840
         self.nLi_s = self.n_Li_s
 
         # Voltage limits and current scale
         self.volt_max = 4.2
         self.volt_min = 2.5
-        self.OneC = cfg.get('OneC', 5.0)
+        self.OneC = cfg['OneC']
 
         # Discretization
-        self.Nr = cfg.get('n_r', 15)
-        self.Nxn = cfg.get('n_x_n', 10)
-        self.Nxs = cfg.get('n_x_s', 5)
-        self.Nxp = cfg.get('n_x_p', 10)
+        self.Nr = cfg['n_r']
+        self.Nxn = cfg['n_x_n']
+        self.Nxs = cfg['n_x_s']
+        self.Nxp = cfg['n_x_p']
         self.Nx = self.Nxn + self.Nxs + self.Nxp
         self.delta_x_n = 1 / self.Nxn
         self.delta_x_s = 1 / self.Nxs
@@ -206,7 +219,7 @@ class InitParamsSPMe:
         self.eps_dx_n = self.epsilon_e_n * self.dx_n
         self.eps_dx_s = self.epsilon_e_s * self.dx_s
         self.eps_dx_p = self.epsilon_e_p * self.dx_p
-        self.delta_t = cfg.get('h', 1)
+        self.delta_t = cfg['h']
 
         # State dimensions
         self.n_cs_n = self.Nr - 1
@@ -222,6 +235,7 @@ class InitParamsSPMe:
         self.nLi_e = self.A_e * self.c_e * (
             self.epsilon_e_n * self.L_n + self.epsilon_e_s * self.L_s + self.epsilon_e_p * self.L_p
         )
+        self.nLi_e_init = self.nLi_e if self.nLi_e_init_cfg is None else float(self.nLi_e_init_cfg)
 
         self.C_ce = build_C_ce(self)
 
