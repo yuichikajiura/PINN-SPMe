@@ -12,15 +12,15 @@ layer_lstm: 1
 layer_fc: 1
 hidden_lstm: 32
 hidden_fc: 128
-epochs: 1000
+epochs: 50000
 lrate: 0.001
-decay_step: 500
-decay_rate: 0.999
+decay_step: 10000
+decay_rate: 0.9999
 activation: tanh
 network_output: raw
 seed: 1234
-print_every: 20
-checkpoint_every: 100
+print_every: 100
+checkpoint_every: 1000
 keep_last_checkpoint: true
 save_optimizer_state: true
 resume_from_checkpoint:
@@ -31,7 +31,7 @@ use_wandb: true
 wandb_project: pinn-spme
 wandb_run_name: spme-pinn
 wandb_mode: online
-wandb_plot_every: 100
+wandb_plot_every: 1000
 wandb_plot_samples: 20
 
 # Sequence / integration
