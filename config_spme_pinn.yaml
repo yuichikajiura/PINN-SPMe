@@ -2,7 +2,7 @@ model_type: spme
 method: pinn
 
 # Save / logging
-save_dir: results/spme_pinn_from_nn_2000
+save_dir: results/spme_pinn_from_nn_2000_sei_fixed
 network_save_name: pinn_spme.pth
 history_save_name: pinn_spme_history.csv
 
