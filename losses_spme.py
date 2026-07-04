@@ -7,12 +7,22 @@ from electrolyte_fvm import electrolyte_lithium_inventory
 _mse = nn.MSELoss()
 
 
-def rmse_loss(prediction, target):
+def rmse_loss(prediction, target, sample_weights=None):
+    if sample_weights is None:
+        return torch.sqrt(_mse(prediction, target))
+    error_sq = (prediction - target) ** 2
+    per_sample = error_sq.reshape(error_sq.shape[0], -1).mean(dim=1)
+    weights = sample_weights.to(dtype=per_sample.dtype, device=per_sample.device).reshape(-1)
+    denom = weights.sum().clamp_min(torch.finfo(per_sample.dtype).eps)
+    return torch.sqrt((per_sample * weights).sum() / denom)
+
+
+def voltage_loss(prediction, target, sample_weights=None):
+    return rmse_loss(prediction, target, sample_weights=sample_weights)
+
+
+def legacy_rmse_loss(prediction, target):
     return torch.sqrt(_mse(prediction, target))
-
-
-def voltage_loss(prediction, target):
-    return rmse_loss(prediction, target)
 
 
 def solid_lithium_loss(model, c_n_seq, c_p_seq, target_inventory):

@@ -59,6 +59,66 @@ def _create_window_metadata(lengths, window, stride=1, max_windows=None, seed=0)
     }
 
 
+def _configured_file_weights(cfg, split_name, profile_names):
+    value = cfg.get(f'{split_name}_data_file_weights', cfg.get('data_file_weights', None))
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        weights = []
+        for name in profile_names:
+            if name in value:
+                weights.append(float(value[name]))
+            elif os.path.basename(name) in value:
+                weights.append(float(value[os.path.basename(name)]))
+            else:
+                raise ValueError(f"Missing {split_name}_data_file_weights entry for {name}")
+        return np.asarray(weights, dtype=np.float64)
+    if len(value) != len(profile_names):
+        raise ValueError(
+            f"{split_name}_data_file_weights has {len(value)} entries, "
+            f"but {len(profile_names)} {split_name} files were loaded."
+        )
+    return np.asarray([float(item) for item in value], dtype=np.float64)
+
+
+def _window_weights_from_metadata(metadata, split_data, cfg):
+    profile_names = [profile['name'] for profile in split_data.get('profiles', [])]
+    split_name = split_data.get('split', 'train')
+    file_weights = _configured_file_weights(cfg, split_name, profile_names)
+    n_windows = len(metadata['profile_idx'])
+    if file_weights is None:
+        return np.ones(n_windows, dtype=np.float32), None
+    if np.any(file_weights < 0):
+        raise ValueError(f"{split_name}_data_file_weights must be non-negative.")
+    if not np.any(file_weights > 0):
+        raise ValueError(f"At least one {split_name}_data_file_weights entry must be positive.")
+
+    profile_idx = metadata['profile_idx']
+    weights = np.zeros(n_windows, dtype=np.float64)
+    summary = []
+    for idx, name in enumerate(profile_names):
+        mask = profile_idx == idx
+        count = int(mask.sum())
+        if count == 0:
+            per_window = 0.0
+        else:
+            per_window = float(file_weights[idx]) / count
+            weights[mask] = per_window
+        summary.append({
+            'name': name,
+            'file_weight': float(file_weights[idx]),
+            'windows': count,
+            'per_window_weight': per_window,
+        })
+
+    mean_weight = weights.mean()
+    if mean_weight > 0:
+        weights = weights / mean_weight
+        for item in summary:
+            item['per_window_weight_normalized'] = item['per_window_weight'] / mean_weight
+    return weights.astype(np.float32), summary
+
+
 def _pinn_rollout_steps(cfg):
     return int(cfg.get('pinn_rollout_steps', cfg.get('rollout_steps', cfg['k'])))
 
@@ -98,7 +158,14 @@ def _iter_ordered_profile_batches(dataset, batch_size, shuffle_profiles=False, s
 
 def _slice_pinn_dataset(dataset, row_slice):
     subset = {}
-    tensor_keys = {'u', 'i_future_ave', 'i_future_sampled', 'v_future_sampled', 'x_future_sampled'}
+    tensor_keys = {
+        'u',
+        'i_future_ave',
+        'i_future_sampled',
+        'v_future_sampled',
+        'x_future_sampled',
+        'window_weights',
+    }
     for key, value in dataset.items():
         if key in tensor_keys:
             subset[key] = value[row_slice]
@@ -339,10 +406,12 @@ def _prepare_dataset(split_data, cfg, p, device):
     v_windows = _create_windows(split_data['voltage'], window_length, lengths, stride, max_windows, cfg.get('seed', 0))
     x_windows = _create_windows(split_data['state'], window_length, lengths, stride, max_windows, cfg.get('seed', 0))
     metadata = _create_window_metadata(lengths, window_length, stride, max_windows, cfg.get('seed', 0))
+    window_weights_np, weight_summary = _window_weights_from_metadata(metadata, split_data, cfg)
 
     i_windows = torch.tensor(i_windows, dtype=torch.float32, device=device)
     v_windows = torch.tensor(v_windows, dtype=torch.float32, device=device)
     x_windows = torch.tensor(x_windows, dtype=torch.float32, device=device)
+    window_weights = torch.tensor(window_weights_np, dtype=torch.float32, device=device)
 
     u = torch.zeros(i_windows.shape[0], k, p.input_size, device=device)
     u[:, :, 0] = i_windows[:, :k]
@@ -374,6 +443,8 @@ def _prepare_dataset(split_data, cfg, p, device):
         'i_future_sampled': i_future_sampled,
         'v_future_sampled': v_future_sampled,
         'x_future_sampled': x_future_sampled,
+        'window_weights': window_weights,
+        'weight_summary': weight_summary,
         'metadata': metadata,
         'profile_slices': _profile_slices_from_metadata(metadata),
         'window_stride': stride,
@@ -548,6 +619,7 @@ def _load_pretrained_nn_models(cfg, nn_models, device):
 
 def _evaluate(nn_models, model, dataset, cfg, p):
     with torch.no_grad():
+        sample_weights = dataset.get('window_weights', None)
         x0_raw = predict_spme_state_raw(nn_models, dataset['u'])
         # SPMe physics expects raw concentration units.
         x_roll_future = model(x0_raw, dataset['i_future_ave'])
@@ -558,11 +630,23 @@ def _evaluate(nn_models, model, dataset, cfg, p):
                                      disable_electrolyte_ohmic=cfg.get('disable_electrolyte_ohmic', False),
                                      disable_electrolyte_concentration=cfg.get('disable_electrolyte_concentration', False))
 
-        loss_v = losses_spme.voltage_loss(vt_pred, dataset['v_future_sampled'])
-        loss_li_s, loss_li_e, li_stats = _bare_nn_lithium_inventory_losses(model, x0_raw, p)
+        loss_v = losses_spme.voltage_loss(vt_pred, dataset['v_future_sampled'], sample_weights=sample_weights)
+        loss_li_s, loss_li_e, li_stats = _bare_nn_lithium_inventory_losses(
+            model,
+            x0_raw,
+            p,
+            sample_weights=sample_weights,
+        )
         w_integ = cfg.get('w_integ', 1.0)
         if w_integ:
-            loss_integ, integ_stats = _profile_integration_consistency_loss(model, x_roll_raw, x0_raw, dataset, p)
+            loss_integ, integ_stats = _profile_integration_consistency_loss(
+                model,
+                x_roll_raw,
+                x0_raw,
+                dataset,
+                p,
+                sample_weights=sample_weights,
+            )
         else:
             loss_integ = torch.zeros((), dtype=x_roll_raw.dtype, device=x_roll_raw.device)
             integ_stats = {'loss_integ_n': loss_integ, 'loss_integ_e': loss_integ, 'loss_integ_p': loss_integ}
@@ -655,6 +739,15 @@ def _load_prepared_pinn_data(cfg, device, p):
     train_data = _prepare_dataset(dataset['train'], cfg, p, device)
     val_data = _prepare_dataset(dataset['val'], cfg, p, device)
     print(f"Prepared windows: train={train_data['u'].shape[0]}, val={val_data['u'].shape[0]}")
+    for split_name, split in [('train', train_data), ('val', val_data)]:
+        if split.get('weight_summary'):
+            print(f"  {split_name} file weights:")
+            for item in split['weight_summary']:
+                print(
+                    f"    {item['name']}: file_weight={item['file_weight']:.6g}, "
+                    f"windows={item['windows']}, "
+                    f"per_window_weight={item['per_window_weight_normalized']:.6g}"
+                )
     return train_data, val_data
 
 
@@ -681,15 +774,24 @@ def _nn_grouped_normalized_losses(pred_raw, target_raw, model, p):
     return loss, loss_c_s_n, loss_c_e, loss_c_s_p
 
 
-def _relative_inventory_estimation_loss(inventory, estimate, init_scale, eps=1e-12):
+def _relative_inventory_estimation_loss(inventory, estimate, init_scale, eps=1e-12, sample_weights=None):
     estimate = estimate.to(dtype=inventory.dtype, device=inventory.device).reshape(())
     scale = init_scale.to(dtype=inventory.dtype, device=inventory.device).reshape(()).abs() + eps
     rel = (inventory - estimate) / scale
     target = torch.zeros_like(rel)
-    loss = losses_spme.rmse_loss(rel, target)
-    mean_pred = inventory.mean()
-    std_pred = inventory.std(unbiased=False)
-    rel_std = torch.sqrt(torch.mean(((inventory - mean_pred) / scale) ** 2))
+    loss = losses_spme.rmse_loss(rel.reshape(-1, 1), target.reshape(-1, 1), sample_weights=sample_weights)
+    if sample_weights is None:
+        mean_pred = inventory.mean()
+        std_pred = inventory.std(unbiased=False)
+        rel_std = torch.sqrt(torch.mean(((inventory - mean_pred) / scale) ** 2))
+    else:
+        flat_inventory = inventory.reshape(-1)
+        weights = sample_weights.to(dtype=inventory.dtype, device=inventory.device).reshape(-1)
+        denom = weights.sum().clamp_min(torch.finfo(inventory.dtype).eps)
+        mean_pred = (flat_inventory * weights).sum() / denom
+        variance = (((flat_inventory - mean_pred) ** 2) * weights).sum() / denom
+        std_pred = torch.sqrt(variance)
+        rel_std = torch.sqrt(((((flat_inventory - mean_pred) / scale) ** 2) * weights).sum() / denom)
     return loss, mean_pred, std_pred, estimate, rel_std
 
 
@@ -767,7 +869,7 @@ def _delta_sei_grad_diagnostics(model):
     return stats
 
 
-def _bare_nn_lithium_inventory_losses(model, x_nn_raw, p, eps=1e-12, timer=None):
+def _bare_nn_lithium_inventory_losses(model, x_nn_raw, p, eps=1e-12, timer=None, sample_weights=None):
     if x_nn_raw.shape[0] == 0:
         zero = torch.zeros((), dtype=x_nn_raw.dtype, device=x_nn_raw.device)
         return zero, zero, {
@@ -792,12 +894,12 @@ def _bare_nn_lithium_inventory_losses(model, x_nn_raw, p, eps=1e-12, timer=None)
         )
         n_li_s_nn = model.calc_solid_lithium(c_n_nn, c_p_nn)
         loss_li_s, mean_s, std_s, est_s, rel_std_s = _relative_inventory_estimation_loss(
-            n_li_s_nn, model.nLi_s_est, model.nLi_s_init, eps
+            n_li_s_nn, model.nLi_s_est, model.nLi_s_init, eps, sample_weights=sample_weights
         )
     with timer.section('loss_li_e'):
         n_li_e_nn = electrolyte_lithium_inventory(c_e_nn, p, model.electrolyte_dynamic(c_e_nn))
         loss_li_e, mean_e, std_e, est_e, rel_std_e = _relative_inventory_estimation_loss(
-            n_li_e_nn, model.nLi_e_est, model.nLi_e_init, eps
+            n_li_e_nn, model.nLi_e_est, model.nLi_e_init, eps, sample_weights=sample_weights
         )
     stats = {
         'nLi_s_mean': mean_s,
@@ -815,9 +917,18 @@ def _bare_nn_lithium_inventory_losses(model, x_nn_raw, p, eps=1e-12, timer=None)
     return loss_li_s, loss_li_e, stats
 
 
-def _integration_consistency_loss_from_predictions(model, x_roll_raw, x_nn_raw, p, window_stride, rollout_steps):
+def _integration_consistency_loss_from_predictions(
+    model,
+    x_roll_raw,
+    x_nn_raw,
+    p,
+    window_stride,
+    rollout_steps,
+    sample_weights=None,
+):
     pred_blocks = []
     roll_blocks = []
+    weight_blocks = []
     n_samples = x_nn_raw.shape[0]
     max_offset = int(rollout_steps) // int(window_stride)
     for offset in range(1, max_offset + 1):
@@ -826,6 +937,8 @@ def _integration_consistency_loss_from_predictions(model, x_roll_raw, x_nn_raw, 
             break
         pred_blocks.append(x_nn_raw[offset:])
         roll_blocks.append(x_roll_raw[:-offset, :, step])
+        if sample_weights is not None:
+            weight_blocks.append(sample_weights[offset:])
 
     if not pred_blocks:
         zero = torch.zeros((), dtype=x_roll_raw.dtype, device=x_roll_raw.device)
@@ -833,19 +946,20 @@ def _integration_consistency_loss_from_predictions(model, x_roll_raw, x_nn_raw, 
 
     shifted_pred_raw = torch.cat(pred_blocks, dim=0)
     integrated_raw = torch.cat(roll_blocks, dim=0)
+    shifted_weights = torch.cat(weight_blocks, dim=0) if weight_blocks else None
     shifted_pred_norm = normalize_state(shifted_pred_raw, p)
     integrated_norm = normalize_state(integrated_raw, p)
 
     pred_n, pred_e, pred_p = model.unpack_state(shifted_pred_norm)
     integ_n, integ_e, integ_p = model.unpack_state(integrated_norm)
-    loss_n = losses_spme.rmse_loss(pred_n, integ_n)
-    loss_e = losses_spme.rmse_loss(pred_e, integ_e)
-    loss_p = losses_spme.rmse_loss(pred_p, integ_p)
+    loss_n = losses_spme.rmse_loss(pred_n, integ_n, sample_weights=shifted_weights)
+    loss_e = losses_spme.rmse_loss(pred_e, integ_e, sample_weights=shifted_weights)
+    loss_p = losses_spme.rmse_loss(pred_p, integ_p, sample_weights=shifted_weights)
     loss = (loss_n + loss_e + loss_p) / 3.0
     return loss, {'loss_integ_n': loss_n, 'loss_integ_e': loss_e, 'loss_integ_p': loss_p}
 
 
-def _profile_integration_consistency_loss(model, x_roll_raw, x_nn_raw, dataset, p):
+def _profile_integration_consistency_loss(model, x_roll_raw, x_nn_raw, dataset, p, sample_weights=None):
     losses = []
     losses_n = []
     losses_e = []
@@ -861,17 +975,27 @@ def _profile_integration_consistency_loss(model, x_roll_raw, x_nn_raw, dataset, 
             p,
             window_stride,
             rollout_steps,
+            sample_weights=(
+                sample_weights[profile_start:profile_end]
+                if sample_weights is not None else None
+            ),
         )
         if torch.isfinite(loss):
             losses.append(loss)
             losses_n.append(stats['loss_integ_n'])
             losses_e.append(stats['loss_integ_e'])
             losses_p.append(stats['loss_integ_p'])
-            weights.append(profile_end - profile_start)
+            if sample_weights is None:
+                weights.append(profile_end - profile_start)
+            else:
+                weights.append(sample_weights[profile_start:profile_end].sum().detach())
     if not losses:
         zero = torch.zeros((), dtype=x_roll_raw.dtype, device=x_roll_raw.device)
         return zero, {'loss_integ_n': zero, 'loss_integ_e': zero, 'loss_integ_p': zero}
-    weight_tensor = torch.as_tensor(weights, dtype=x_roll_raw.dtype, device=x_roll_raw.device)
+    if sample_weights is None:
+        weight_tensor = torch.as_tensor(weights, dtype=x_roll_raw.dtype, device=x_roll_raw.device)
+    else:
+        weight_tensor = torch.stack(weights).to(dtype=x_roll_raw.dtype, device=x_roll_raw.device)
 
     def weighted(values):
         return (torch.stack(values) * weight_tensor).sum() / weight_tensor.sum()
@@ -1622,6 +1746,7 @@ def train(cfg, device, p):
                 epoch_nli_e_mean = 0.0
                 epoch_nli_e_std = 0.0
                 epoch_nli_e_rel_std = 0.0
+                epoch_weight = 0.0
                 delta_sei_grad_debug_stats = None
                 delta_sei_grad_debug_done = False
 
@@ -1638,6 +1763,7 @@ def train(cfg, device, p):
                             i_future_ave_batch = train_data['i_future_ave'][batch_slice]
                             i_future_sampled_batch = train_data['i_future_sampled'][batch_slice]
                             v_target_batch = train_data['v_future_sampled'][batch_slice]
+                            weights_batch = train_data['window_weights'][batch_slice]
 
                         with timer.section('nn_forward'):
                             x0_raw = predict_spme_state_raw(nn_models, u_batch)
@@ -1658,10 +1784,18 @@ def train(cfg, device, p):
                                 disable_electrolyte_ohmic=cfg.get('disable_electrolyte_ohmic', False),
                                 disable_electrolyte_concentration=cfg.get('disable_electrolyte_concentration', False),
                             )
-                            loss_v = losses_spme.voltage_loss(vt_pred, v_target_batch)
+                            loss_v = losses_spme.voltage_loss(
+                                vt_pred,
+                                v_target_batch,
+                                sample_weights=weights_batch,
+                            )
 
                         loss_li_s, loss_li_e, li_stats = _bare_nn_lithium_inventory_losses(
-                            model, x0_raw, p, timer=timer
+                            model,
+                            x0_raw,
+                            p,
+                            timer=timer,
+                            sample_weights=weights_batch,
                         )
                         w_integ = cfg.get('w_integ', 1.0)
                         with timer.section('loss_integ'):
@@ -1673,6 +1807,7 @@ def train(cfg, device, p):
                                     p,
                                     int(train_data.get('window_stride', cfg.get('train_window_stride', 1))),
                                     int(train_data.get('pinn_rollout_steps', x_roll_raw.shape[-1] - 1)),
+                                    sample_weights=weights_batch,
                                 )
                             else:
                                 loss_integ = torch.zeros((), dtype=x_roll_raw.dtype, device=x_roll_raw.device)
@@ -1697,40 +1832,43 @@ def train(cfg, device, p):
                                 optimizer.step()
                             model.clamp_inventory_parameters()
 
-                        epoch_loss += loss.item() * u_batch.shape[0]
-                        epoch_loss_v += loss_v.item() * u_batch.shape[0]
-                        epoch_loss_li_s += loss_li_s.item() * u_batch.shape[0]
-                        epoch_loss_li_e += loss_li_e.item() * u_batch.shape[0]
-                        epoch_loss_integ += loss_integ.item() * u_batch.shape[0]
-                        epoch_loss_integ_n += integ_stats['loss_integ_n'].item() * u_batch.shape[0]
-                        epoch_loss_integ_e += integ_stats['loss_integ_e'].item() * u_batch.shape[0]
-                        epoch_loss_integ_p += integ_stats['loss_integ_p'].item() * u_batch.shape[0]
-                        epoch_nli_s_mean += li_stats['nLi_s_mean'].item() * u_batch.shape[0]
-                        epoch_nli_s_std += li_stats['std_pred_nLi_s'].item() * u_batch.shape[0]
-                        epoch_nli_s_rel_std += li_stats['nLi_s_rel_std'].item() * u_batch.shape[0]
-                        epoch_nli_e_mean += li_stats['nLi_e_mean'].item() * u_batch.shape[0]
-                        epoch_nli_e_std += li_stats['std_pred_nLi_e'].item() * u_batch.shape[0]
-                        epoch_nli_e_rel_std += li_stats['nLi_e_rel_std'].item() * u_batch.shape[0]
+                        batch_weight = float(weights_batch.sum().detach().cpu())
+                        epoch_weight += batch_weight
+                        epoch_loss += loss.item() * batch_weight
+                        epoch_loss_v += loss_v.item() * batch_weight
+                        epoch_loss_li_s += loss_li_s.item() * batch_weight
+                        epoch_loss_li_e += loss_li_e.item() * batch_weight
+                        epoch_loss_integ += loss_integ.item() * batch_weight
+                        epoch_loss_integ_n += integ_stats['loss_integ_n'].item() * batch_weight
+                        epoch_loss_integ_e += integ_stats['loss_integ_e'].item() * batch_weight
+                        epoch_loss_integ_p += integ_stats['loss_integ_p'].item() * batch_weight
+                        epoch_nli_s_mean += li_stats['nLi_s_mean'].item() * batch_weight
+                        epoch_nli_s_std += li_stats['std_pred_nLi_s'].item() * batch_weight
+                        epoch_nli_s_rel_std += li_stats['nLi_s_rel_std'].item() * batch_weight
+                        epoch_nli_e_mean += li_stats['nLi_e_mean'].item() * batch_weight
+                        epoch_nli_e_std += li_stats['std_pred_nLi_e'].item() * batch_weight
+                        epoch_nli_e_rel_std += li_stats['nLi_e_rel_std'].item() * batch_weight
 
                 if epoch >= cfg['decay_step']:
                     for optimizer in optimizers:
                         for group in optimizer.param_groups:
                             group['lr'] *= cfg['decay_rate']
 
-            epoch_loss /= n_samples
-            epoch_loss_v /= n_samples
-            epoch_loss_li_s /= n_samples
-            epoch_loss_li_e /= n_samples
-            epoch_loss_integ /= n_samples
-            epoch_loss_integ_n /= n_samples
-            epoch_loss_integ_e /= n_samples
-            epoch_loss_integ_p /= n_samples
-            epoch_nli_s_mean /= n_samples
-            epoch_nli_s_std /= n_samples
-            epoch_nli_s_rel_std /= n_samples
-            epoch_nli_e_mean /= n_samples
-            epoch_nli_e_std /= n_samples
-            epoch_nli_e_rel_std /= n_samples
+            epoch_denominator = epoch_weight if epoch_weight > 0.0 else float(n_samples)
+            epoch_loss /= epoch_denominator
+            epoch_loss_v /= epoch_denominator
+            epoch_loss_li_s /= epoch_denominator
+            epoch_loss_li_e /= epoch_denominator
+            epoch_loss_integ /= epoch_denominator
+            epoch_loss_integ_n /= epoch_denominator
+            epoch_loss_integ_e /= epoch_denominator
+            epoch_loss_integ_p /= epoch_denominator
+            epoch_nli_s_mean /= epoch_denominator
+            epoch_nli_s_std /= epoch_denominator
+            epoch_nli_s_rel_std /= epoch_denominator
+            epoch_nli_e_mean /= epoch_denominator
+            epoch_nli_e_std /= epoch_denominator
+            epoch_nli_e_rel_std /= epoch_denominator
             degradation_epoch = _float_stats(_degradation_stats(model, cfg))
             nli_s_est_epoch = degradation_epoch['nLi_s_est']
             nli_e_est_epoch = degradation_epoch['nLi_e_est']

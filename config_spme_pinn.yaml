@@ -2,7 +2,7 @@ model_type: spme
 method: pinn
 
 # Save / logging
-save_dir: results/spme_pinn_from_nn_2000_sei_fixed
+save_dir: results/spme_pinn_dst_hppc_weighted
 network_save_name: pinn_spme.pth
 history_save_name: pinn_spme_history.csv
 
@@ -46,11 +46,21 @@ electrolyte_substeps: 1  # 1 for implicit, 5-20 for rk4 depending on h
 data_source: csv
 data_dir: data
 train_data_files:
-  - spme_train_BJDST_soh90.csv
-  - spme_train_FUDS_soh90.csv
-  - spme_train_US06_soh90.csv
-val_data_files:
   - spme_val_DST_soh90.csv
+  - id_HPPC_SOC030_rest120s_pulse10s_soh90.csv
+  - id_HPPC_SOC045_rest120s_pulse10s_soh90.csv
+  - id_HPPC_SOC060_rest120s_pulse10s_soh90.csv
+  - id_HPPC_SOC075_rest120s_pulse10s_soh90.csv
+  - id_HPPC_SOC090_rest120s_pulse10s_soh90.csv
+train_data_file_weights:
+  - 1.0  # spme_val_DST_soh90.csv
+  - 0.2  # id_HPPC_SOC030_rest120s_pulse10s_soh90.csv
+  - 0.2  # id_HPPC_SOC045_rest120s_pulse10s_soh90.csv
+  - 0.2  # id_HPPC_SOC060_rest120s_pulse10s_soh90.csv
+  - 0.2  # id_HPPC_SOC075_rest120s_pulse10s_soh90.csv
+  - 0.2  # id_HPPC_SOC090_rest120s_pulse10s_soh90.csv
+val_data_files:
+  - spme_debug_CC_1C_discharge_soh90.csv
 test_data_files:
   - spme_debug_CC_1C_discharge_soh90.csv
 
