@@ -1009,6 +1009,7 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
             i_target,
             disable_electrolyte_ohmic=cfg.get('disable_electrolyte_ohmic', False),
             disable_electrolyte_concentration=cfg.get('disable_electrolyte_concentration', False),
+            delta_sei_override=model.p.delta_sei_true,
         )
 
         x_roll_raw = torch.full_like(x_nn_raw, float('nan'))

@@ -418,7 +418,8 @@ class SPMeModel(nn.Module):
 
     def calc_voltage_components(self, css_n, css_p, c_e, current,
                                 disable_electrolyte_ohmic=False,
-                                disable_electrolyte_concentration=False):
+                                disable_electrolyte_concentration=False,
+                                delta_sei_override=None):
         original_shape = css_n.shape
         css_n_flat = css_n.reshape(-1, 1).clamp(1.0, self.p.c_s_n_max * 0.999)
         css_p_flat = css_p.reshape(-1, 1).clamp(1.0, self.p.c_s_p_max * 0.999)
@@ -431,7 +432,11 @@ class SPMeModel(nn.Module):
         else:
             raise ValueError('c_e must be 2D or 3D.')
 
-        dynamic = self.electrolyte_dynamic(c_e_flat)
+        if delta_sei_override is None:
+            delta_sei = self.delta_sei_est.to(dtype=css_n_flat.dtype, device=css_n_flat.device)
+        else:
+            delta_sei = torch.as_tensor(delta_sei_override, dtype=css_n_flat.dtype, device=css_n_flat.device).reshape(())
+        dynamic = self.electrolyte_dynamic_from_delta(delta_sei, c_e_flat)
         ce0n, cens, cesp, ce0p, c_ex = electrolyte_boundary_concentrations(c_e_flat, self.p, dynamic)
 
         cen_bar = c_ex[:, :self.p.Nxn + 1].mean(dim=1, keepdim=True)
@@ -453,8 +458,8 @@ class SPMeModel(nn.Module):
         rtaf = (self.p.R * self.p.T_amb) / (self.p.alph * self.p.Faraday)
         eta_p = rtaf * torch.arcsinh(-current_flat / (2 * self.p.a_s_p * self.p.Area_p * self.p.L_p * i_0p))
         eta_n = rtaf * torch.arcsinh(current_flat / (2 * self.p.a_s_n * self.p.Area_n * self.p.L_n * i_0n))
-        R_f_n = self.R_f_n_est.to(dtype=css_n_flat.dtype, device=css_n_flat.device)
-        epsilon_e_n = self.epsilon_e_n_est.to(dtype=css_n_flat.dtype, device=css_n_flat.device)
+        R_f_n = torch.as_tensor(self.p.R_f_n_base, dtype=css_n_flat.dtype, device=css_n_flat.device) + delta_sei / self.p.kappa_sei
+        epsilon_e_n = self.epsilon_e_n_from_delta(delta_sei).to(dtype=css_n_flat.dtype, device=css_n_flat.device)
         film_drop = (R_f_n / (self.p.a_s_n * self.p.L_n * self.p.Area_n)
                      + self.p.R_f_p / (self.p.a_s_p * self.p.L_p * self.p.Area_p)) * current_flat
 

@@ -93,9 +93,9 @@ estimate_delta_sei: true
 nLi_s_fresh: 0.2840
 nLi_s_init: 0.2840
 nLi_e_init: 0.0053677182
-delta_sei_init: 1.0e-12
-delta_sei_lower: 0.0
-delta_sei_upper: 2.0e-6
+delta_sei_init: 5.05188e-07 #1.0e-12
+delta_sei_lower: 5.05187e-07 #0.0
+delta_sei_upper: 5.05189e-07 #2.0e-6
 delta_sei_true: 5.05188e-07
 epsilon_e_n_true: 0.0560283
 lrate_sei: 0.001
