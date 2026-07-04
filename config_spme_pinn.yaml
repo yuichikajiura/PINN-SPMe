@@ -106,7 +106,7 @@ supervise_states: false
 
 eval_every: 100
 full_eval_every: 500
-profile_timing: true
+profile_timing: false
 profile_timing_every: 20
 profile_timing_warmup_epochs: 5
 profile_timing_log_wandb: false
