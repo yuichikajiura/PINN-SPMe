@@ -37,7 +37,7 @@ wandb_plot_samples: 20
 # Sequence / integration
 k: 90
 h: 1
-pinn_rollout_steps: 90
+pinn_rollout_steps: 120
 integ_type: 0   # 0 = RK4, 1 = Euler
 electrolyte_integrator: implicit  # rk4 for debugging, implicit for h=1 training
 electrolyte_substeps: 1  # 1 for implicit, 5-20 for rk4 depending on h
@@ -97,7 +97,7 @@ disable_electrolyte_concentration: false
 # Core low-loss philosophy
 w_v: 1.0
 w_li_s: 1.0
-w_li_e: 1.0
+w_li_e: 0.0
 w_integ: 1.0
 estimate_nLi_s: false
 estimate_nLi_e: false

@@ -837,6 +837,32 @@ def _true_degradation_for_plot(model, n_samples, ref):
     }
 
 
+def _solid_region_lithium_for_plot(model, c_n, c_p):
+    cs_bar_n = model.calc_cs_bar(c_n)
+    cs_bar_p = model.calc_cs_bar(c_p)
+    return {
+        'anode': cs_bar_n * model.p.epsilon_s_n * model.p.L_n * model.p.Area_n,
+        'cathode': cs_bar_p * model.p.epsilon_s_p * model.p.L_p * model.p.Area_p,
+    }
+
+
+def _electrolyte_region_lithium_for_plot(c_e, p, dynamic=None):
+    n_end = p.Nxn - 1
+    s_end = n_end + p.Nxs - 1
+    c_en = c_e[:, :n_end]
+    c_es = c_e[:, n_end:s_end]
+    c_ep = c_e[:, s_end:]
+    if dynamic is not None and dynamic.get('eps_dx_n', None) is not None:
+        eps_dx_n = torch.as_tensor(dynamic['eps_dx_n'], dtype=c_e.dtype, device=c_e.device).reshape(())
+    else:
+        eps_dx_n = torch.as_tensor(p.eps_dx_n, dtype=c_e.dtype, device=c_e.device)
+    return {
+        'neg': p.A_e * eps_dx_n * c_en.sum(dim=-1),
+        'sep': p.A_e * p.eps_dx_s * c_es.sum(dim=-1),
+        'pos': p.A_e * p.eps_dx_p * c_ep.sum(dim=-1),
+    }
+
+
 def _float_stats(stats):
     return {key: float(value.detach().cpu().reshape(())) for key, value in stats.items()}
 
@@ -1111,6 +1137,10 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
         true_dynamic = true_degradation['dynamic']
         pred_c_ex = reconstruct_full_concentration(pred_c_e, model.p, pred_dynamic)
         true_c_ex = reconstruct_full_concentration(true_c_e, model.p, true_dynamic)
+        n_li_s_regions_true = _solid_region_lithium_for_plot(model, true_c_n, true_c_p)
+        n_li_s_regions_pred = _solid_region_lithium_for_plot(model, pred_c_n, pred_c_p)
+        n_li_e_regions_true = _electrolyte_region_lithium_for_plot(true_c_e, model.p, true_dynamic)
+        n_li_e_regions_pred = _electrolyte_region_lithium_for_plot(pred_c_e, model.p, pred_dynamic)
         n_li_s_true = true_degradation['nLi_s']
         n_li_s_pred = model.calc_solid_lithium(pred_c_n, pred_c_p)
         n_li_e_true = true_degradation['nLi_e']
@@ -1188,6 +1218,7 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
 
         roll_c_n = roll_c_p = roll_c_ex = components_roll = None
         n_li_s_roll = n_li_e_roll = n_li_sei_roll = None
+        n_li_s_regions_roll = n_li_e_regions_roll = None
         valid_roll_state = torch.isfinite(x_roll_raw).all(dim=1)
         if valid_roll_state.any():
             i_roll_target = i_target[valid_roll_state]
@@ -1195,6 +1226,8 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
             _, roll_c_e_valid, _ = model.unpack_state(x_roll_raw[valid_roll_state])
             roll_dynamic = model.electrolyte_dynamic(roll_c_e_valid)
             roll_c_ex_valid = reconstruct_full_concentration(roll_c_e_valid, model.p, roll_dynamic)
+            n_li_s_regions_roll_valid = _solid_region_lithium_for_plot(model, roll_c_n_valid, roll_c_p_valid)
+            n_li_e_regions_roll_valid = _electrolyte_region_lithium_for_plot(roll_c_e_valid, model.p, roll_dynamic)
             n_li_s_roll_valid = model.calc_solid_lithium(roll_c_n_valid, roll_c_p_valid)
             n_li_e_roll_valid = electrolyte_lithium_inventory(roll_c_e_valid, model.p, roll_dynamic)
             components_roll_valid = model.calc_voltage_components(
@@ -1211,12 +1244,24 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
             n_li_s_roll = torch.full_like(n_li_s_pred, float('nan'))
             n_li_e_roll = torch.full_like(n_li_e_pred, float('nan'))
             n_li_sei_roll = torch.full_like(n_li_sei_pred, float('nan'))
+            n_li_s_regions_roll = {
+                name: torch.full_like(value, float('nan'))
+                for name, value in n_li_s_regions_pred.items()
+            }
+            n_li_e_regions_roll = {
+                name: torch.full_like(value, float('nan'))
+                for name, value in n_li_e_regions_pred.items()
+            }
             roll_c_n[valid_roll_state] = roll_c_n_valid
             roll_c_p[valid_roll_state] = roll_c_p_valid
             roll_c_ex[valid_roll_state] = roll_c_ex_valid
             n_li_s_roll[valid_roll_state] = n_li_s_roll_valid
             n_li_e_roll[valid_roll_state] = n_li_e_roll_valid
             n_li_sei_roll[valid_roll_state] = n_li_sei_pred[valid_roll_state]
+            for name, value in n_li_s_regions_roll_valid.items():
+                n_li_s_regions_roll[name][valid_roll_state] = value
+            for name, value in n_li_e_regions_roll_valid.items():
+                n_li_e_regions_roll[name][valid_roll_state] = value
             components_roll = {}
             for name, value in components_pred.items():
                 filled = torch.full_like(value.reshape_as(v_target), float('nan'))
@@ -1232,9 +1277,27 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
         'n_li_s_true': n_li_s_true.detach().cpu().numpy().reshape(-1),
         'n_li_s_pred': n_li_s_pred.detach().cpu().numpy().reshape(-1),
         'n_li_s_roll': None if n_li_s_roll is None else n_li_s_roll.detach().cpu().numpy().reshape(-1),
+        'n_li_s_regions_true': {
+            name: value.detach().cpu().numpy().reshape(-1) for name, value in n_li_s_regions_true.items()
+        },
+        'n_li_s_regions_pred': {
+            name: value.detach().cpu().numpy().reshape(-1) for name, value in n_li_s_regions_pred.items()
+        },
+        'n_li_s_regions_roll': None if n_li_s_regions_roll is None else {
+            name: value.detach().cpu().numpy().reshape(-1) for name, value in n_li_s_regions_roll.items()
+        },
         'n_li_e_true': n_li_e_true.detach().cpu().numpy().reshape(-1),
         'n_li_e_pred': n_li_e_pred.detach().cpu().numpy().reshape(-1),
         'n_li_e_roll': None if n_li_e_roll is None else n_li_e_roll.detach().cpu().numpy().reshape(-1),
+        'n_li_e_regions_true': {
+            name: value.detach().cpu().numpy().reshape(-1) for name, value in n_li_e_regions_true.items()
+        },
+        'n_li_e_regions_pred': {
+            name: value.detach().cpu().numpy().reshape(-1) for name, value in n_li_e_regions_pred.items()
+        },
+        'n_li_e_regions_roll': None if n_li_e_regions_roll is None else {
+            name: value.detach().cpu().numpy().reshape(-1) for name, value in n_li_e_regions_roll.items()
+        },
         'n_li_sei_true': n_li_sei_true.detach().cpu().numpy().reshape(-1),
         'n_li_sei_pred': n_li_sei_pred.detach().cpu().numpy().reshape(-1),
         'n_li_sei_roll': None if n_li_sei_roll is None else n_li_sei_roll.detach().cpu().numpy().reshape(-1),
