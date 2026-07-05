@@ -1155,11 +1155,6 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
                 _sample_chunks(i_windows_roll_t[:, k:], h),
             ], dim=1)
 
-            roll_sum = torch.zeros_like(x_nn_raw)
-            roll_count = torch.zeros(x_nn_raw.shape[0], 1, dtype=x_nn_raw.dtype, device=device)
-            v_roll_sum = torch.zeros_like(v_target)
-            v_roll_count = torch.zeros_like(v_target)
-
             for start_idx in range(0, u_roll.shape[0], batch_size):
                 end_idx = start_idx + batch_size
                 u_batch = u_roll[start_idx:end_idx]
@@ -1181,22 +1176,15 @@ def _predict_profile_windows(nn_models, model, profile, cfg, device):
                 )
 
                 n_batch = x_roll_seq_batch.shape[0]
+                final_seq_idx = x_roll_seq_batch.shape[-1] - 1
                 for local_idx in range(n_batch):
                     global_start = start_idx + local_idx
-                    for seq_idx in range(1, x_roll_seq_batch.shape[-1]):
-                        absolute_idx = global_start + k - 1 + seq_idx * h
-                        if absolute_idx >= length:
-                            continue
-                        aligned_idx = absolute_idx - (k - 1)
-                        roll_sum[aligned_idx] += x_roll_seq_batch[local_idx, :, seq_idx]
-                        roll_count[aligned_idx] += 1.0
-                        v_roll_sum[aligned_idx] += v_roll_seq_batch[local_idx, seq_idx]
-                        v_roll_count[aligned_idx] += 1.0
-
-            valid_roll = roll_count.squeeze(1) > 0
-            x_roll_raw[valid_roll] = roll_sum[valid_roll] / roll_count[valid_roll]
-            valid_v_roll = v_roll_count.squeeze(1) > 0
-            v_roll[valid_v_roll] = v_roll_sum[valid_v_roll] / v_roll_count[valid_v_roll]
+                    absolute_idx = global_start + k - 1 + final_seq_idx * h
+                    if absolute_idx >= length:
+                        continue
+                    aligned_idx = absolute_idx - (k - 1)
+                    x_roll_raw[aligned_idx] = x_roll_seq_batch[local_idx, :, final_seq_idx]
+                    v_roll[aligned_idx] = v_roll_seq_batch[local_idx, final_seq_idx]
 
         roll_c_n = roll_c_p = roll_c_ex = components_roll = None
         n_li_s_roll = n_li_e_roll = n_li_sei_roll = None
