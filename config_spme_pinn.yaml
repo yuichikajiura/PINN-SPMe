@@ -2,7 +2,7 @@ model_type: spme
 method: pinn
 
 # Save / logging
-save_dir: results/spme_pinn_dst_hppc_weighted
+save_dir: results/spme_pinn_dst_hppc_no_nLi_e_loss_new_dataset
 network_save_name: pinn_spme.pth
 history_save_name: pinn_spme_history.csv
 
