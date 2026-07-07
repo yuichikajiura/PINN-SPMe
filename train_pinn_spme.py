@@ -163,9 +163,13 @@ def _pinn_rollout_steps(cfg):
 
 def _pinn_rollout_mode(cfg):
     mode = str(cfg.get('pinn_rollout_mode', 'standard')).lower()
-    if mode not in {'standard', 'direct_exact'}:
-        raise ValueError("pinn_rollout_mode must be 'standard' or 'direct_exact'.")
+    if mode not in {'standard', 'direct_exact', 'fast_rk4'}:
+        raise ValueError("pinn_rollout_mode must be 'standard', 'direct_exact', or 'fast_rk4'.")
     return mode
+
+
+def _is_sparse_rollout_mode(mode):
+    return mode in {'direct_exact', 'fast_rk4'}
 
 
 def _pinn_rollout_eval_steps(cfg):
@@ -221,6 +225,8 @@ def _slice_pinn_dataset(dataset, row_slice):
         'x_future_sampled',
         'window_weights',
         'i_direct_avg',
+        'i_fast_rk4_avg',
+        'fast_rk4_h',
         'valid_time_mask',
     }
     for key, value in dataset.items():
@@ -449,7 +455,7 @@ def _load_training_dataset(cfg, device, p):
     return {'train': train, 'val': val}
 
 
-def _prepare_direct_exact_dataset(split_data, cfg, p, device, eval_steps):
+def _prepare_sparse_rollout_dataset(split_data, cfg, p, device, eval_steps, rollout_mode):
     k = int(cfg['k'])
     lengths = split_data['lengths']
     split_name = split_data.get('split', 'train')
@@ -472,10 +478,16 @@ def _prepare_direct_exact_dataset(split_data, cfg, p, device, eval_steps):
     state = np.asarray(split_data['state'], dtype=np.float32)
     n_windows = len(metadata['global_start_idx'])
     n_targets = len(eval_steps)
+    fast_rk4_chunk_h = int(cfg.get('fast_rk4_chunk_h', 3))
+    if fast_rk4_chunk_h < 1:
+        raise ValueError("fast_rk4_chunk_h must be a positive integer.")
+    max_fast_rk4_chunks = int(np.ceil(max(max(eval_steps) - 1, 0) / fast_rk4_chunk_h))
 
     i_context = np.zeros((n_windows, k), dtype=np.float32)
     v_context = np.zeros((n_windows, k), dtype=np.float32)
     i_direct_avg = np.zeros((n_windows, n_targets), dtype=np.float32)
+    i_fast_rk4_avg = np.zeros((n_windows, n_targets, max_fast_rk4_chunks), dtype=np.float32)
+    fast_rk4_h = np.zeros((n_windows, n_targets, max_fast_rk4_chunks), dtype=np.float32)
     i_final = np.zeros((n_windows, n_targets), dtype=np.float32)
     v_final = np.zeros((n_windows, n_targets), dtype=np.float32)
     x_final = np.zeros((n_windows, n_targets, state.shape[1]), dtype=np.float32)
@@ -501,11 +513,23 @@ def _prepare_direct_exact_dataset(split_data, cfg, p, device, eval_steps):
             h_direct = step - 1
             if h_direct > 0:
                 i_direct_avg[row, col] = current[base_idx + 1:target_idx].mean()
+            offset = 0
+            chunk_idx = 0
+            while offset < h_direct:
+                h_chunk = min(fast_rk4_chunk_h, h_direct - offset)
+                chunk_start = base_idx + offset + 1
+                chunk_end = chunk_start + h_chunk
+                i_fast_rk4_avg[row, col, chunk_idx] = current[chunk_start:chunk_end].mean()
+                fast_rk4_h[row, col, chunk_idx] = h_chunk
+                offset += h_chunk
+                chunk_idx += 1
 
     i_windows = torch.tensor(i_context, dtype=torch.float32, device=device)
     v_windows = torch.tensor(v_context, dtype=torch.float32, device=device)
     x_initial = torch.tensor(x_initial, dtype=torch.float32, device=device)
     i_direct_avg = torch.tensor(i_direct_avg, dtype=torch.float32, device=device)
+    i_fast_rk4_avg = torch.tensor(i_fast_rk4_avg, dtype=torch.float32, device=device)
+    fast_rk4_h = torch.tensor(fast_rk4_h, dtype=torch.float32, device=device)
     i_final = torch.tensor(i_final, dtype=torch.float32, device=device)
     v_final = torch.tensor(v_final, dtype=torch.float32, device=device)
     x_final = torch.tensor(x_final, dtype=torch.float32, device=device)
@@ -543,13 +567,20 @@ def _prepare_direct_exact_dataset(split_data, cfg, p, device, eval_steps):
         'profile_slices': _profile_slices_from_metadata(metadata),
         'window_stride': stride,
         'pinn_rollout_steps': n_targets,
-        'pinn_rollout_mode': 'direct_exact',
+        'pinn_rollout_mode': rollout_mode,
         'pinn_rollout_eval_steps': eval_steps,
         'i_direct_avg': i_direct_avg,
         'direct_h': torch.tensor([step - 1 for step in eval_steps], dtype=torch.float32, device=device),
+        'i_fast_rk4_avg': i_fast_rk4_avg,
+        'fast_rk4_h': fast_rk4_h,
+        'fast_rk4_chunk_h': fast_rk4_chunk_h,
         'valid_time_mask': valid_time_mask,
         'profiles': split_data.get('profiles', []),
     }
+
+
+def _prepare_direct_exact_dataset(split_data, cfg, p, device, eval_steps):
+    return _prepare_sparse_rollout_dataset(split_data, cfg, p, device, eval_steps, 'direct_exact')
 
 
 def _prepare_dataset(split_data, cfg, p, device):
@@ -557,9 +588,11 @@ def _prepare_dataset(split_data, cfg, p, device):
     h = int(cfg['h'])
     rollout_steps = _pinn_rollout_steps(cfg)
     rollout_mode = _pinn_rollout_mode(cfg)
-    eval_steps = _pinn_rollout_eval_steps(cfg) if rollout_mode == 'direct_exact' else None
+    eval_steps = _pinn_rollout_eval_steps(cfg) if _is_sparse_rollout_mode(rollout_mode) else None
     if rollout_mode == 'direct_exact':
         return _prepare_direct_exact_dataset(split_data, cfg, p, device, eval_steps)
+    if rollout_mode == 'fast_rk4':
+        return _prepare_sparse_rollout_dataset(split_data, cfg, p, device, eval_steps, 'fast_rk4')
     max_rollout_step = max(eval_steps) if eval_steps else rollout_steps
     window_length = k + max_rollout_step
     lengths = split_data['lengths']
@@ -851,6 +884,12 @@ def _direct_exact_rollout(model, x0_raw, dataset):
     i_sampled = dataset['i_future_sampled']
     n_targets = i_direct_avg.shape[1]
     batch_size = x0_raw.shape[0]
+    if i_direct_avg.shape[0] != batch_size or i_sampled.shape[0] != batch_size:
+        raise ValueError(
+            "Direct-exact rollout dataset batch size does not match x0_raw: "
+            f"x0_raw={batch_size}, i_direct_avg={i_direct_avg.shape[0]}, "
+            f"i_future_sampled={i_sampled.shape[0]}"
+        )
 
     x_start = x0_raw.unsqueeze(1).expand(-1, n_targets, -1).reshape(batch_size * n_targets, -1)
     h_flat = direct_h.unsqueeze(0).expand(batch_size, -1).reshape(-1)
@@ -879,6 +918,66 @@ def _direct_exact_rollout(model, x0_raw, dataset):
     return torch.cat([x0_raw.unsqueeze(-1), x_target], dim=-1)
 
 
+def _model_step_variable_h(model, x, current, h_values):
+    h_values = h_values.to(dtype=x.dtype, device=x.device).reshape(-1)
+    x_next = x.clone()
+    old_h = model.h
+    try:
+        for h_value in torch.unique(h_values.detach().cpu()).tolist():
+            mask = h_values == h_value
+            model.h = float(h_value)
+            x_next[mask] = model.step(x[mask], current[mask])
+    finally:
+        model.h = old_h
+    return x_next
+
+
+def _fast_rk4_rollout(model, x0_raw, dataset):
+    i_fast_rk4_avg = dataset['i_fast_rk4_avg']
+    fast_rk4_h = dataset['fast_rk4_h'].to(dtype=x0_raw.dtype, device=x0_raw.device)
+    i_sampled = dataset['i_future_sampled']
+    n_targets = i_fast_rk4_avg.shape[1]
+    batch_size = x0_raw.shape[0]
+    if i_fast_rk4_avg.shape[0] != batch_size or i_sampled.shape[0] != batch_size:
+        raise ValueError(
+            "Fast-RK4 rollout dataset batch size does not match x0_raw: "
+            f"x0_raw={batch_size}, i_fast_rk4_avg={i_fast_rk4_avg.shape[0]}, "
+            f"i_future_sampled={i_sampled.shape[0]}"
+        )
+
+    x_work = x0_raw.unsqueeze(1).expand(-1, n_targets, -1).reshape(batch_size * n_targets, -1)
+    current_schedule = i_fast_rk4_avg.reshape(batch_size * n_targets, -1, 1)
+    h_schedule = fast_rk4_h.reshape(batch_size * n_targets, -1)
+
+    old_integ_type = model.integ_type
+    try:
+        model.integ_type = 0
+        for chunk_idx in range(h_schedule.shape[1]):
+            h_flat = h_schedule[:, chunk_idx]
+            chunk_mask = h_flat > 0
+            if bool(chunk_mask.any()):
+                x_work = x_work.clone()
+                x_work[chunk_mask] = _model_step_variable_h(
+                    model,
+                    x_work[chunk_mask],
+                    current_schedule[:, chunk_idx, :][chunk_mask],
+                    h_flat[chunk_mask],
+                )
+
+        final_current_flat = i_sampled[:, 1:].reshape(-1, 1)
+        x_target = _model_step_variable_h(
+            model,
+            x_work,
+            final_current_flat,
+            torch.ones(batch_size * n_targets, dtype=x0_raw.dtype, device=x0_raw.device),
+        )
+    finally:
+        model.integ_type = old_integ_type
+
+    x_target = x_target.reshape(batch_size, n_targets, -1).permute(0, 2, 1)
+    return torch.cat([x0_raw.unsqueeze(-1), x_target], dim=-1)
+
+
 def _masked_rmse_loss(prediction, target, valid_time_mask, sample_weights=None):
     error_sq = (prediction - target) ** 2
     if error_sq.dim() == 2:
@@ -901,10 +1000,33 @@ def _voltage_loss_from_dataset(prediction, target, dataset, sample_weights=None)
 
 
 def _rollout_from_dataset(model, x0_raw, dataset, cfg):
-    if dataset.get('pinn_rollout_mode', _pinn_rollout_mode(cfg)) == 'direct_exact':
+    rollout_mode = dataset.get('pinn_rollout_mode', _pinn_rollout_mode(cfg))
+    if rollout_mode == 'direct_exact':
         return _direct_exact_rollout(model, x0_raw, dataset)
+    if rollout_mode == 'fast_rk4':
+        return _fast_rk4_rollout(model, x0_raw, dataset)
     x_roll_future = model(x0_raw, dataset['i_future_ave'])
     return torch.cat([x0_raw.unsqueeze(-1), x_roll_future], dim=-1)
+
+
+def _dataset_head(dataset, n_samples):
+    subset = dict(dataset)
+    for key in (
+        'u',
+        'i_future_ave',
+        'i_future_sampled',
+        'v_future_sampled',
+        'x_future_sampled',
+        'i_direct_avg',
+        'i_fast_rk4_avg',
+        'fast_rk4_h',
+        'valid_time_mask',
+        'window_weights',
+    ):
+        value = dataset.get(key, None)
+        if torch.is_tensor(value) and value.shape[0] >= n_samples:
+            subset[key] = value[:n_samples]
+    return subset
 
 
 def _evaluate(nn_models, model, dataset, cfg, p):
@@ -927,8 +1049,8 @@ def _evaluate(nn_models, model, dataset, cfg, p):
             sample_weights=sample_weights,
         )
         w_integ = cfg.get('w_integ', 1.0)
-        if w_integ and dataset.get('pinn_rollout_mode') != 'direct_exact':
-            loss_integ, integ_stats = _profile_integration_consistency_loss(
+        if w_integ:
+            loss_integ, integ_stats = _integration_consistency_loss(
                 model,
                 x_roll_raw,
                 x0_raw,
@@ -970,13 +1092,14 @@ def _warm_start_diagnostics(nn_models, model, dataset, cfg, p, prefix):
     n_samples = min(dataset['u'].shape[0], max_windows)
     if n_samples == 0:
         return {}
+    dataset = _dataset_head(dataset, n_samples)
 
     with torch.no_grad():
-        u = dataset['u'][:n_samples]
-        i_future_ave = dataset['i_future_ave'][:n_samples]
-        i_future_sampled = dataset['i_future_sampled'][:n_samples]
-        v_future_sampled = dataset['v_future_sampled'][:n_samples]
-        target_seq_raw = dataset['x_future_sampled'][:n_samples]
+        u = dataset['u']
+        i_future_ave = dataset['i_future_ave']
+        i_future_sampled = dataset['i_future_sampled']
+        v_future_sampled = dataset['v_future_sampled']
+        target_seq_raw = dataset['x_future_sampled']
 
         x_nn_raw = predict_spme_state_raw(nn_models, u)
         target0_raw = target_seq_raw[:, 0, :]
@@ -1004,7 +1127,7 @@ def _warm_start_diagnostics(nn_models, model, dataset, cfg, p, prefix):
             loss_roll_state_norm = _masked_rmse_loss(
                 normalize_state(x_roll_raw, p),
                 normalize_state(target_roll_raw, p),
-                dataset['valid_time_mask'][:n_samples],
+                dataset['valid_time_mask'],
             )
 
         c_n_roll_seq, c_p_roll_seq = model.calc_css_and_cs0_seq(x_roll_raw, i_future_sampled)
@@ -1047,8 +1170,6 @@ def _load_prepared_pinn_data(cfg, device, p):
             f"max={int(valid_counts.max().item())}, "
             f"partial={(valid_counts < len(train_data['pinn_rollout_eval_steps'])).sum().item()}"
         )
-        if cfg.get('w_integ', 1.0):
-            print("  note: loss_integ is disabled for direct_exact irregular rollout targets.")
     for split_name, split in [('train', train_data), ('val', val_data)]:
         if split.get('weight_summary'):
             print(f"  {split_name} file weights:")
@@ -1343,6 +1464,81 @@ def _profile_integration_consistency_loss(model, x_roll_raw, x_nn_raw, dataset, 
         'loss_integ_p': weighted(losses_p),
     }
     return loss, stats
+
+
+def _sparse_integration_consistency_loss(model, x_roll_raw, x_nn_raw, dataset, p, sample_weights=None):
+    eval_steps = dataset.get('pinn_rollout_eval_steps', None)
+    if not eval_steps:
+        zero = torch.zeros((), dtype=x_roll_raw.dtype, device=x_roll_raw.device)
+        return zero, {'loss_integ_n': zero, 'loss_integ_e': zero, 'loss_integ_p': zero}
+
+    window_stride = int(dataset.get('window_stride', 1))
+    step_to_col = {}
+    for col, step in enumerate(eval_steps, start=1):
+        step = int(step)
+        if step > 0 and step % window_stride == 0:
+            step_to_col[step] = col
+
+    if not step_to_col:
+        zero = torch.zeros((), dtype=x_roll_raw.dtype, device=x_roll_raw.device)
+        return zero, {'loss_integ_n': zero, 'loss_integ_e': zero, 'loss_integ_p': zero}
+
+    valid_time_mask = dataset.get('valid_time_mask', None)
+    pred_blocks = []
+    roll_blocks = []
+    weight_blocks = []
+    mask_blocks = []
+
+    for profile_start, profile_end in dataset.get('profile_slices', [(0, x_nn_raw.shape[0])]):
+        n_profile = profile_end - profile_start
+        if n_profile <= 1:
+            continue
+        profile_pred = x_nn_raw[profile_start:profile_end]
+        profile_roll = x_roll_raw[profile_start:profile_end]
+        profile_weights = (
+            sample_weights[profile_start:profile_end]
+            if sample_weights is not None else None
+        )
+        profile_valid = (
+            valid_time_mask[profile_start:profile_end]
+            if valid_time_mask is not None else None
+        )
+
+        for step, col in step_to_col.items():
+            offset = step // window_stride
+            if offset >= n_profile or col >= profile_roll.shape[-1]:
+                continue
+            pred_blocks.append(profile_pred[offset:])
+            roll_blocks.append(profile_roll[:-offset, :, col])
+            if profile_weights is not None:
+                weight_blocks.append(profile_weights[offset:])
+            if profile_valid is not None:
+                mask_blocks.append(profile_valid[:-offset, col])
+
+    if not pred_blocks:
+        zero = torch.zeros((), dtype=x_roll_raw.dtype, device=x_roll_raw.device)
+        return zero, {'loss_integ_n': zero, 'loss_integ_e': zero, 'loss_integ_p': zero}
+
+    shifted_pred_norm = normalize_state(torch.cat(pred_blocks, dim=0), p)
+    integrated_norm = normalize_state(torch.cat(roll_blocks, dim=0), p)
+    shifted_weights = torch.cat(weight_blocks, dim=0) if weight_blocks else None
+    if mask_blocks:
+        valid_mask = torch.cat(mask_blocks, dim=0).to(dtype=integrated_norm.dtype, device=integrated_norm.device)
+        shifted_weights = valid_mask if shifted_weights is None else shifted_weights * valid_mask
+
+    pred_n, pred_e, pred_p = model.unpack_state(shifted_pred_norm)
+    integ_n, integ_e, integ_p = model.unpack_state(integrated_norm)
+    loss_n = losses_spme.rmse_loss(pred_n, integ_n, sample_weights=shifted_weights)
+    loss_e = losses_spme.rmse_loss(pred_e, integ_e, sample_weights=shifted_weights)
+    loss_p = losses_spme.rmse_loss(pred_p, integ_p, sample_weights=shifted_weights)
+    loss = (loss_n + loss_e + loss_p) / 3.0
+    return loss, {'loss_integ_n': loss_n, 'loss_integ_e': loss_e, 'loss_integ_p': loss_p}
+
+
+def _integration_consistency_loss(model, x_roll_raw, x_nn_raw, dataset, p, sample_weights=None):
+    if _is_sparse_rollout_mode(dataset.get('pinn_rollout_mode')):
+        return _sparse_integration_consistency_loss(model, x_roll_raw, x_nn_raw, dataset, p, sample_weights)
+    return _profile_integration_consistency_loss(model, x_roll_raw, x_nn_raw, dataset, p, sample_weights)
 
 
 def _evaluate_nn(nn_models, model, dataset, cfg, p):
@@ -2132,13 +2328,21 @@ def train(cfg, device, p):
                         # SPMe physics expects raw concentration units.
                         with timer.section('rollout'):
                             batch_dataset = train_data
-                            if train_data.get('pinn_rollout_mode') == 'direct_exact':
+                            if _is_sparse_rollout_mode(train_data.get('pinn_rollout_mode')):
                                 batch_dataset = dict(train_data)
                                 batch_dataset['i_direct_avg'] = train_data['i_direct_avg'][batch_slice]
+                                batch_dataset['i_fast_rk4_avg'] = train_data['i_fast_rk4_avg'][batch_slice]
+                                batch_dataset['fast_rk4_h'] = train_data['fast_rk4_h'][batch_slice]
                                 batch_dataset['i_future_sampled'] = i_future_sampled_batch
                                 batch_dataset['valid_time_mask'] = train_data['valid_time_mask'][batch_slice]
+                                batch_dataset['profile_slices'] = [(0, u_batch.shape[0])]
                             else:
-                                batch_dataset = {'i_future_ave': i_future_ave_batch}
+                                batch_dataset = {
+                                    'i_future_ave': i_future_ave_batch,
+                                    'window_stride': train_data.get('window_stride', cfg.get('train_window_stride', 1)),
+                                    'pinn_rollout_steps': train_data.get('pinn_rollout_steps', cfg.get('pinn_rollout_steps', cfg['k'])),
+                                    'profile_slices': [(0, u_batch.shape[0])],
+                                }
                             x_roll_raw = _rollout_from_dataset(model, x0_raw, batch_dataset, cfg)
 
                         with timer.section('loss_voltage'):
@@ -2168,14 +2372,13 @@ def train(cfg, device, p):
                         )
                         w_integ = cfg.get('w_integ', 1.0)
                         with timer.section('loss_integ'):
-                            if w_integ and train_data.get('pinn_rollout_mode') != 'direct_exact':
-                                loss_integ, integ_stats = _integration_consistency_loss_from_predictions(
+                            if w_integ:
+                                loss_integ, integ_stats = _integration_consistency_loss(
                                     model,
                                     x_roll_raw,
                                     x0_raw,
+                                    batch_dataset,
                                     p,
-                                    int(train_data.get('window_stride', cfg.get('train_window_stride', 1))),
-                                    int(train_data.get('pinn_rollout_steps', x_roll_raw.shape[-1] - 1)),
                                     sample_weights=weights_batch,
                                 )
                             else:

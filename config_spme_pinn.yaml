@@ -19,7 +19,7 @@ decay_rate: 0.9999
 activation: tanh
 network_output: raw
 seed: 1234
-print_every: 20
+print_every: 1
 checkpoint_every: 100
 keep_last_checkpoint: true
 save_optimizer_state: true
@@ -38,14 +38,18 @@ wandb_plot_samples: 20
 k: 90
 h: 1
 pinn_rollout_steps: 120
-pinn_rollout_mode: direct_exact  # standard or direct_exact
-# Used only when pinn_rollout_mode: direct_exact.
+pinn_rollout_mode: direct_exact  # standard, direct_exact, or fast_rk4
+# Used only when pinn_rollout_mode: direct_exact or fast_rk4.
 # Direct exact mode evaluates x(k-1+step) for each listed step using one
 # averaged-current exact solid step to step-1, then a final h=1 step.
-pinn_rollout_eval_steps: [1, 2, 5, 10, 30, 60, 120, 300]
-# Used only when pinn_rollout_mode: direct_exact. If true, late-profile windows
+# Fast RK4 mode evaluates the same sparse steps, but advances to step-1 using
+# RK4 chunks of up to fast_rk4_chunk_h seconds with averaged current, then a
+# final h=1 RK4 step with the sampled target current.
+pinn_rollout_eval_steps: [1, 2, 5, 10, 30, 60, 120, 240]
+# Used only when pinn_rollout_mode: direct_exact or fast_rk4. If true, late-profile windows
 # with limited future data are kept and only valid eval steps contribute to loss.
 pinn_allow_partial_rollout_windows: true
+fast_rk4_chunk_h: 3
 integ_type: 0   # 0 = RK4, 1 = Euler
 electrolyte_integrator: implicit  # rk4 for debugging, implicit for h=1 training
 electrolyte_substeps: 1  # 1 for implicit, 5-20 for rk4 depending on h
@@ -105,7 +109,7 @@ disable_electrolyte_concentration: false
 # Core low-loss philosophy
 w_v: 1.0
 w_li_s: 1.0
-w_li_e: 0.0
+w_li_e: 1.0
 w_integ: 1.0
 estimate_nLi_s: false
 estimate_nLi_e: false
