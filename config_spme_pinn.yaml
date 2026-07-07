@@ -2,7 +2,7 @@ model_type: spme
 method: pinn
 
 # Save / logging
-save_dir: results/spme_pinn_new_dataset
+save_dir: results/spme_pinn_direct_exact
 network_save_name: pinn_spme.pth
 history_save_name: pinn_spme_history.csv
 
