@@ -59,6 +59,44 @@ def _create_window_metadata(lengths, window, stride=1, max_windows=None, seed=0)
     }
 
 
+def _create_direct_exact_metadata(lengths, k, eval_steps, stride=1, max_windows=None, seed=0, allow_partial=True):
+    rows = []
+    offset = 0
+    min_step = min(eval_steps) if allow_partial else max(eval_steps)
+    for profile_idx, length in enumerate(lengths):
+        if length < k + min_step:
+            raise ValueError(
+                f"Profile length {length} is shorter than required direct-exact window length {k + min_step}."
+            )
+        for start_idx in range(0, length - k - min_step + 1, stride):
+            available_future = length - (start_idx + k - 1) - 1
+            valid_steps = [step for step in eval_steps if step <= available_future]
+            if not valid_steps:
+                continue
+            rows.append((
+                profile_idx,
+                offset + start_idx,
+                start_idx,
+                start_idx + k - 1 + max(valid_steps),
+                available_future,
+            ))
+        offset += length
+    if not rows:
+        raise ValueError("No direct-exact PINN windows could be created with the requested eval steps.")
+    rows = np.asarray(rows, dtype=np.int64)
+    if max_windows is not None and max_windows > 0 and rows.shape[0] > max_windows:
+        rng = np.random.default_rng(seed)
+        keep = np.sort(rng.choice(rows.shape[0], size=max_windows, replace=False))
+        rows = rows[keep]
+    return {
+        'profile_idx': rows[:, 0],
+        'global_start_idx': rows[:, 1],
+        'window_start_idx': rows[:, 2],
+        'target_idx': rows[:, 3],
+        'available_future_steps': rows[:, 4],
+    }
+
+
 def _configured_file_weights(cfg, split_name, profile_names):
     value = cfg.get(f'{split_name}_data_file_weights', cfg.get('data_file_weights', None))
     if value is None:
@@ -123,6 +161,23 @@ def _pinn_rollout_steps(cfg):
     return int(cfg.get('pinn_rollout_steps', cfg.get('rollout_steps', cfg['k'])))
 
 
+def _pinn_rollout_mode(cfg):
+    mode = str(cfg.get('pinn_rollout_mode', 'standard')).lower()
+    if mode not in {'standard', 'direct_exact'}:
+        raise ValueError("pinn_rollout_mode must be 'standard' or 'direct_exact'.")
+    return mode
+
+
+def _pinn_rollout_eval_steps(cfg):
+    steps = cfg.get('pinn_rollout_eval_steps', None)
+    if steps is None:
+        return None
+    steps = sorted({int(step) for step in steps})
+    if not steps or steps[0] < 1:
+        raise ValueError("pinn_rollout_eval_steps must contain positive integer offsets.")
+    return steps
+
+
 def _profile_slices_from_metadata(metadata):
     profile_ids = metadata['profile_idx']
     if len(profile_ids) == 0:
@@ -165,6 +220,8 @@ def _slice_pinn_dataset(dataset, row_slice):
         'v_future_sampled',
         'x_future_sampled',
         'window_weights',
+        'i_direct_avg',
+        'valid_time_mask',
     }
     for key, value in dataset.items():
         if key in tensor_keys:
@@ -392,11 +449,119 @@ def _load_training_dataset(cfg, device, p):
     return {'train': train, 'val': val}
 
 
+def _prepare_direct_exact_dataset(split_data, cfg, p, device, eval_steps):
+    k = int(cfg['k'])
+    lengths = split_data['lengths']
+    split_name = split_data.get('split', 'train')
+    stride = cfg.get(f'{split_name}_window_stride', cfg.get('window_stride', 1))
+    max_windows = cfg.get(f'max_{split_name}_windows', cfg.get('max_windows', None))
+    allow_partial = bool(cfg.get('pinn_allow_partial_rollout_windows', True))
+    metadata = _create_direct_exact_metadata(
+        lengths,
+        k,
+        eval_steps,
+        stride=stride,
+        max_windows=max_windows,
+        seed=cfg.get('seed', 0),
+        allow_partial=allow_partial,
+    )
+    window_weights_np, weight_summary = _window_weights_from_metadata(metadata, split_data, cfg)
+
+    current = np.asarray(split_data['current'], dtype=np.float32)
+    voltage = np.asarray(split_data['voltage'], dtype=np.float32)
+    state = np.asarray(split_data['state'], dtype=np.float32)
+    n_windows = len(metadata['global_start_idx'])
+    n_targets = len(eval_steps)
+
+    i_context = np.zeros((n_windows, k), dtype=np.float32)
+    v_context = np.zeros((n_windows, k), dtype=np.float32)
+    i_direct_avg = np.zeros((n_windows, n_targets), dtype=np.float32)
+    i_final = np.zeros((n_windows, n_targets), dtype=np.float32)
+    v_final = np.zeros((n_windows, n_targets), dtype=np.float32)
+    x_final = np.zeros((n_windows, n_targets, state.shape[1]), dtype=np.float32)
+    valid_targets = np.zeros((n_windows, n_targets), dtype=bool)
+    x_initial = np.zeros((n_windows, state.shape[1]), dtype=np.float32)
+
+    for row, global_start in enumerate(metadata['global_start_idx']):
+        start = int(global_start)
+        base_idx = start + k - 1
+        i_context[row] = current[start:start + k]
+        v_context[row] = voltage[start:start + k]
+        x_initial[row] = state[base_idx]
+        for col, step in enumerate(eval_steps):
+            target_idx = base_idx + step
+            if target_idx >= len(current):
+                continue
+            if step > int(metadata['available_future_steps'][row]):
+                continue
+            valid_targets[row, col] = True
+            i_final[row, col] = current[target_idx]
+            v_final[row, col] = voltage[target_idx]
+            x_final[row, col] = state[target_idx]
+            h_direct = step - 1
+            if h_direct > 0:
+                i_direct_avg[row, col] = current[base_idx + 1:target_idx].mean()
+
+    i_windows = torch.tensor(i_context, dtype=torch.float32, device=device)
+    v_windows = torch.tensor(v_context, dtype=torch.float32, device=device)
+    x_initial = torch.tensor(x_initial, dtype=torch.float32, device=device)
+    i_direct_avg = torch.tensor(i_direct_avg, dtype=torch.float32, device=device)
+    i_final = torch.tensor(i_final, dtype=torch.float32, device=device)
+    v_final = torch.tensor(v_final, dtype=torch.float32, device=device)
+    x_final = torch.tensor(x_final, dtype=torch.float32, device=device)
+    valid_targets = torch.tensor(valid_targets, dtype=torch.bool, device=device)
+    window_weights = torch.tensor(window_weights_np, dtype=torch.float32, device=device)
+
+    u = torch.zeros(n_windows, k, p.input_size, device=device)
+    u[:, :, 0] = i_windows
+    u[:, :, 1] = v_windows
+
+    ub = torch.tensor([
+        cfg['OneC'] * cfg['max_Crate'],
+        cfg['V_upper'],
+    ], dtype=torch.float32, device=device)
+    lb = torch.tensor([
+        -cfg['OneC'] * cfg['max_Crate'],
+        cfg['V_lower'],
+    ], dtype=torch.float32, device=device)
+    u = (u - lb) / (ub - lb)
+
+    valid_time_mask = torch.cat([
+        torch.ones(n_windows, 1, dtype=torch.bool, device=device),
+        valid_targets,
+    ], dim=1)
+
+    return {
+        'u': u,
+        'i_future_ave': i_direct_avg,
+        'i_future_sampled': torch.cat([i_windows[:, k - 1:k], i_final], dim=1),
+        'v_future_sampled': torch.cat([v_windows[:, k - 1:k], v_final], dim=1),
+        'x_future_sampled': torch.cat([x_initial.unsqueeze(1), x_final], dim=1),
+        'window_weights': window_weights,
+        'weight_summary': weight_summary,
+        'metadata': metadata,
+        'profile_slices': _profile_slices_from_metadata(metadata),
+        'window_stride': stride,
+        'pinn_rollout_steps': n_targets,
+        'pinn_rollout_mode': 'direct_exact',
+        'pinn_rollout_eval_steps': eval_steps,
+        'i_direct_avg': i_direct_avg,
+        'direct_h': torch.tensor([step - 1 for step in eval_steps], dtype=torch.float32, device=device),
+        'valid_time_mask': valid_time_mask,
+        'profiles': split_data.get('profiles', []),
+    }
+
+
 def _prepare_dataset(split_data, cfg, p, device):
     k = int(cfg['k'])
     h = int(cfg['h'])
     rollout_steps = _pinn_rollout_steps(cfg)
-    window_length = k + rollout_steps
+    rollout_mode = _pinn_rollout_mode(cfg)
+    eval_steps = _pinn_rollout_eval_steps(cfg) if rollout_mode == 'direct_exact' else None
+    if rollout_mode == 'direct_exact':
+        return _prepare_direct_exact_dataset(split_data, cfg, p, device, eval_steps)
+    max_rollout_step = max(eval_steps) if eval_steps else rollout_steps
+    window_length = k + max_rollout_step
     lengths = split_data['lengths']
     split_name = split_data.get('split', 'train')
     stride = cfg.get(f'{split_name}_window_stride', cfg.get('window_stride', 1))
@@ -427,17 +592,41 @@ def _prepare_dataset(split_data, cfg, p, device):
     ], dtype=torch.float32, device=device)
     u = (u - lb) / (ub - lb)
 
-    i_future = i_windows[:, k:]
-    i_future_ave = _average_chunks(i_future, h)
-    i_future_sampled = torch.cat([i_windows[:, k - 1:k], _sample_chunks(i_future, h)], dim=1)
-    v_future_sampled = torch.cat([v_windows[:, k - 1:k], _sample_chunks(v_windows[:, k:], h)], dim=1)
+    if rollout_mode == 'direct_exact':
+        target_cols = [k - 1 + step for step in eval_steps]
+        i_final = i_windows[:, target_cols]
+        v_final = v_windows[:, target_cols]
+        x_final = x_windows[:, target_cols, :]
+        avg_cols = []
+        h_values = []
+        for step in eval_steps:
+            h_direct = step - 1
+            h_values.append(h_direct)
+            if h_direct > 0:
+                avg_cols.append(i_windows[:, k:k + h_direct].mean(dim=1))
+            else:
+                avg_cols.append(torch.zeros_like(i_windows[:, 0]))
+        i_direct_avg = torch.stack(avg_cols, dim=1)
+        direct_h = torch.tensor(h_values, dtype=torch.float32, device=device)
 
-    x_future_sampled = torch.cat([
-        x_windows[:, k - 1:k, :],
-        _sample_state_chunks(x_windows[:, k:, :], h),
-    ], dim=1)
+        i_future_ave = i_direct_avg
+        i_future_sampled = torch.cat([i_windows[:, k - 1:k], i_final], dim=1)
+        v_future_sampled = torch.cat([v_windows[:, k - 1:k], v_final], dim=1)
+        x_future_sampled = torch.cat([x_windows[:, k - 1:k, :], x_final], dim=1)
+    else:
+        i_future = i_windows[:, k:]
+        i_future_ave = _average_chunks(i_future, h)
+        i_future_sampled = torch.cat([i_windows[:, k - 1:k], _sample_chunks(i_future, h)], dim=1)
+        v_future_sampled = torch.cat([v_windows[:, k - 1:k], _sample_chunks(v_windows[:, k:], h)], dim=1)
 
-    return {
+        x_future_sampled = torch.cat([
+            x_windows[:, k - 1:k, :],
+            _sample_state_chunks(x_windows[:, k:, :], h),
+        ], dim=1)
+        i_direct_avg = None
+        direct_h = None
+
+    prepared = {
         'u': u,
         'i_future_ave': i_future_ave,
         'i_future_sampled': i_future_sampled,
@@ -449,8 +638,14 @@ def _prepare_dataset(split_data, cfg, p, device):
         'profile_slices': _profile_slices_from_metadata(metadata),
         'window_stride': stride,
         'pinn_rollout_steps': i_future_ave.shape[1],
+        'pinn_rollout_mode': rollout_mode,
+        'pinn_rollout_eval_steps': eval_steps,
         'profiles': split_data.get('profiles', []),
     }
+    if i_direct_avg is not None:
+        prepared['i_direct_avg'] = i_direct_avg
+        prepared['direct_h'] = direct_h
+    return prepared
 
 
 def _prepare_state_dataset(split_data, cfg, p, device):
@@ -617,20 +812,114 @@ def _load_pretrained_nn_models(cfg, nn_models, device):
     print(f"Loaded pre-trained SPMe NN weights from {checkpoint_path}.")
 
 
+def _linear_step_exact_batched_h(x, current, matA, matB, h_values):
+    n = matA.shape[0]
+    h_values = h_values.to(dtype=x.dtype, device=x.device).reshape(-1, 1, 1)
+    aug = torch.zeros(x.shape[0], n + 1, n + 1, dtype=x.dtype, device=x.device)
+    aug[:, :n, :n] = matA.to(dtype=x.dtype, device=x.device).unsqueeze(0)
+    aug[:, :n, n:n + 1] = matB.to(dtype=x.dtype, device=x.device).unsqueeze(0)
+    exp_aug = torch.matrix_exp(h_values * aug)
+    exp_a = exp_aug[:, :n, :n]
+    exp_b = exp_aug[:, :n, n:n + 1]
+    return torch.bmm(exp_a, x.unsqueeze(-1)).squeeze(-1) + torch.bmm(exp_b, current.unsqueeze(-1)).squeeze(-1)
+
+
+def _exact_solid_step_variable_h(model, x, current, h_values):
+    current = current.to(dtype=x.dtype, device=x.device)
+    h_values = h_values.to(dtype=x.dtype, device=x.device).reshape(-1)
+    c_s_n, c_e, c_s_p = model.unpack_state(x)
+    c_s_n_next = _linear_step_exact_batched_h(c_s_n, current, model.matAn, model.matBn, h_values)
+    c_s_p_next = _linear_step_exact_batched_h(c_s_p, current, model.matAp, model.matBp, h_values)
+
+    c_e_next = torch.empty_like(c_e)
+    jn = current / (model.p.Faraday * model.p.a_s_n * model.p.Area_n * model.p.L_n)
+    jp = -current / (model.p.Faraday * model.p.a_s_p * model.p.Area_p * model.p.L_p)
+    old_h = model.h
+    try:
+        for h_value in torch.unique(h_values.detach().cpu()).tolist():
+            mask = h_values == h_value
+            model.h = float(h_value)
+            c_e_next[mask] = model._electrolyte_step(c_e[mask], jn[mask], jp[mask])
+    finally:
+        model.h = old_h
+    return model.pack_state(c_s_n_next, c_e_next, c_s_p_next)
+
+
+def _direct_exact_rollout(model, x0_raw, dataset):
+    i_direct_avg = dataset['i_direct_avg']
+    direct_h = dataset['direct_h'].to(dtype=x0_raw.dtype, device=x0_raw.device)
+    i_sampled = dataset['i_future_sampled']
+    n_targets = i_direct_avg.shape[1]
+    batch_size = x0_raw.shape[0]
+
+    x_start = x0_raw.unsqueeze(1).expand(-1, n_targets, -1).reshape(batch_size * n_targets, -1)
+    h_flat = direct_h.unsqueeze(0).expand(batch_size, -1).reshape(-1)
+    avg_current_flat = i_direct_avg.reshape(-1, 1)
+    x_before_final = x_start
+
+    coarse_mask = h_flat > 0
+    if bool(coarse_mask.any()):
+        x_before_final = x_before_final.clone()
+        x_before_final[coarse_mask] = _exact_solid_step_variable_h(
+            model,
+            x_start[coarse_mask],
+            avg_current_flat[coarse_mask],
+            h_flat[coarse_mask],
+        )
+
+    final_current_flat = i_sampled[:, 1:].reshape(-1, 1)
+    x_target = _exact_solid_step_variable_h(
+        model,
+        x_before_final,
+        final_current_flat,
+        torch.ones_like(h_flat),
+    )
+
+    x_target = x_target.reshape(batch_size, n_targets, -1).permute(0, 2, 1)
+    return torch.cat([x0_raw.unsqueeze(-1), x_target], dim=-1)
+
+
+def _masked_rmse_loss(prediction, target, valid_time_mask, sample_weights=None):
+    error_sq = (prediction - target) ** 2
+    if error_sq.dim() == 2:
+        per_time = error_sq
+    else:
+        reduce_dims = tuple(range(1, error_sq.dim() - 1))
+        per_time = error_sq.mean(dim=reduce_dims)
+    mask = valid_time_mask.to(dtype=per_time.dtype, device=per_time.device)
+    if sample_weights is not None:
+        mask = mask * sample_weights.to(dtype=per_time.dtype, device=per_time.device).reshape(-1, 1)
+    denom = mask.sum().clamp_min(torch.finfo(per_time.dtype).eps)
+    return torch.sqrt((per_time * mask).sum() / denom)
+
+
+def _voltage_loss_from_dataset(prediction, target, dataset, sample_weights=None):
+    valid_time_mask = dataset.get('valid_time_mask', None)
+    if valid_time_mask is None:
+        return losses_spme.voltage_loss(prediction, target, sample_weights=sample_weights)
+    return _masked_rmse_loss(prediction, target, valid_time_mask, sample_weights=sample_weights)
+
+
+def _rollout_from_dataset(model, x0_raw, dataset, cfg):
+    if dataset.get('pinn_rollout_mode', _pinn_rollout_mode(cfg)) == 'direct_exact':
+        return _direct_exact_rollout(model, x0_raw, dataset)
+    x_roll_future = model(x0_raw, dataset['i_future_ave'])
+    return torch.cat([x0_raw.unsqueeze(-1), x_roll_future], dim=-1)
+
+
 def _evaluate(nn_models, model, dataset, cfg, p):
     with torch.no_grad():
         sample_weights = dataset.get('window_weights', None)
         x0_raw = predict_spme_state_raw(nn_models, dataset['u'])
         # SPMe physics expects raw concentration units.
-        x_roll_future = model(x0_raw, dataset['i_future_ave'])
-        x_roll_raw = torch.cat([x0_raw.unsqueeze(-1), x_roll_future], dim=-1)
+        x_roll_raw = _rollout_from_dataset(model, x0_raw, dataset, cfg)
         c_s_n_seq, c_e_seq, c_s_p_seq = model.unpack_state(x_roll_raw)
         c_n_seq, c_p_seq = model.calc_css_and_cs0_seq(x_roll_raw, dataset['i_future_sampled'])
         vt_pred = model.calc_voltage(c_n_seq[:, -1, :], c_p_seq[:, -1, :], c_e_seq, dataset['i_future_sampled'],
                                      disable_electrolyte_ohmic=cfg.get('disable_electrolyte_ohmic', False),
                                      disable_electrolyte_concentration=cfg.get('disable_electrolyte_concentration', False))
 
-        loss_v = losses_spme.voltage_loss(vt_pred, dataset['v_future_sampled'], sample_weights=sample_weights)
+        loss_v = _voltage_loss_from_dataset(vt_pred, dataset['v_future_sampled'], dataset, sample_weights=sample_weights)
         loss_li_s, loss_li_e, li_stats = _bare_nn_lithium_inventory_losses(
             model,
             x0_raw,
@@ -638,7 +927,7 @@ def _evaluate(nn_models, model, dataset, cfg, p):
             sample_weights=sample_weights,
         )
         w_integ = cfg.get('w_integ', 1.0)
-        if w_integ:
+        if w_integ and dataset.get('pinn_rollout_mode') != 'direct_exact':
             loss_integ, integ_stats = _profile_integration_consistency_loss(
                 model,
                 x_roll_raw,
@@ -707,10 +996,16 @@ def _warm_start_diagnostics(nn_models, model, dataset, cfg, p, prefix):
         loss_bare_v = losses_spme.voltage_loss(v_bare, v_future_sampled[:, 0:1])
 
         # SPMe physics expects raw concentration units.
-        x_roll_future = model(x_nn_raw, i_future_ave)
-        x_roll_raw = torch.cat([x_nn_raw.unsqueeze(-1), x_roll_future], dim=-1)
+        x_roll_raw = _rollout_from_dataset(model, x_nn_raw, dataset, cfg)
         target_roll_raw = target_seq_raw.permute(0, 2, 1)
-        loss_roll_state_norm = losses_spme.rmse_loss(normalize_state(x_roll_raw, p), normalize_state(target_roll_raw, p))
+        if dataset.get('valid_time_mask', None) is None:
+            loss_roll_state_norm = losses_spme.rmse_loss(normalize_state(x_roll_raw, p), normalize_state(target_roll_raw, p))
+        else:
+            loss_roll_state_norm = _masked_rmse_loss(
+                normalize_state(x_roll_raw, p),
+                normalize_state(target_roll_raw, p),
+                dataset['valid_time_mask'][:n_samples],
+            )
 
         c_n_roll_seq, c_p_roll_seq = model.calc_css_and_cs0_seq(x_roll_raw, i_future_sampled)
         _, c_e_roll_seq, _ = model.unpack_state(x_roll_raw)
@@ -722,7 +1017,10 @@ def _warm_start_diagnostics(nn_models, model, dataset, cfg, p, prefix):
             disable_electrolyte_ohmic=cfg.get('disable_electrolyte_ohmic', False),
             disable_electrolyte_concentration=cfg.get('disable_electrolyte_concentration', False),
         )
-        loss_roll_v = losses_spme.voltage_loss(v_roll, v_future_sampled)
+        loss_roll_v = _voltage_loss_from_dataset(v_roll, v_future_sampled, {
+            'valid_time_mask': dataset.get('valid_time_mask', None)[:n_samples]
+            if dataset.get('valid_time_mask', None) is not None else None
+        })
 
     return {
         f'{prefix}/epoch0_bare_state_rmse_norm': loss_bare_state_norm.item(),
@@ -739,6 +1037,18 @@ def _load_prepared_pinn_data(cfg, device, p):
     train_data = _prepare_dataset(dataset['train'], cfg, p, device)
     val_data = _prepare_dataset(dataset['val'], cfg, p, device)
     print(f"Prepared windows: train={train_data['u'].shape[0]}, val={val_data['u'].shape[0]}")
+    print(f"PINN rollout mode: {train_data.get('pinn_rollout_mode', 'standard')}")
+    if train_data.get('pinn_rollout_eval_steps') is not None:
+        print(f"  rollout eval steps: {train_data['pinn_rollout_eval_steps']}")
+        valid_counts = train_data['valid_time_mask'][:, 1:].sum(dim=1)
+        print(
+            "  valid future targets per window: "
+            f"min={int(valid_counts.min().item())}, "
+            f"max={int(valid_counts.max().item())}, "
+            f"partial={(valid_counts < len(train_data['pinn_rollout_eval_steps'])).sum().item()}"
+        )
+        if cfg.get('w_integ', 1.0):
+            print("  note: loss_integ is disabled for direct_exact irregular rollout targets.")
     for split_name, split in [('train', train_data), ('val', val_data)]:
         if split.get('weight_summary'):
             print(f"  {split_name} file weights:")
@@ -1821,8 +2131,15 @@ def train(cfg, device, p):
 
                         # SPMe physics expects raw concentration units.
                         with timer.section('rollout'):
-                            x_roll_future = model(x0_raw, i_future_ave_batch)
-                            x_roll_raw = torch.cat([x0_raw.unsqueeze(-1), x_roll_future], dim=-1)
+                            batch_dataset = train_data
+                            if train_data.get('pinn_rollout_mode') == 'direct_exact':
+                                batch_dataset = dict(train_data)
+                                batch_dataset['i_direct_avg'] = train_data['i_direct_avg'][batch_slice]
+                                batch_dataset['i_future_sampled'] = i_future_sampled_batch
+                                batch_dataset['valid_time_mask'] = train_data['valid_time_mask'][batch_slice]
+                            else:
+                                batch_dataset = {'i_future_ave': i_future_ave_batch}
+                            x_roll_raw = _rollout_from_dataset(model, x0_raw, batch_dataset, cfg)
 
                         with timer.section('loss_voltage'):
                             c_s_n_seq, c_e_seq, c_s_p_seq = model.unpack_state(x_roll_raw)
@@ -1835,9 +2152,10 @@ def train(cfg, device, p):
                                 disable_electrolyte_ohmic=cfg.get('disable_electrolyte_ohmic', False),
                                 disable_electrolyte_concentration=cfg.get('disable_electrolyte_concentration', False),
                             )
-                            loss_v = losses_spme.voltage_loss(
+                            loss_v = _voltage_loss_from_dataset(
                                 vt_pred,
                                 v_target_batch,
+                                batch_dataset,
                                 sample_weights=weights_batch,
                             )
 
@@ -1850,7 +2168,7 @@ def train(cfg, device, p):
                         )
                         w_integ = cfg.get('w_integ', 1.0)
                         with timer.section('loss_integ'):
-                            if w_integ:
+                            if w_integ and train_data.get('pinn_rollout_mode') != 'direct_exact':
                                 loss_integ, integ_stats = _integration_consistency_loss_from_predictions(
                                     model,
                                     x_roll_raw,

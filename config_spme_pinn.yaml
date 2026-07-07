@@ -38,6 +38,14 @@ wandb_plot_samples: 20
 k: 90
 h: 1
 pinn_rollout_steps: 120
+pinn_rollout_mode: direct_exact  # standard or direct_exact
+# Used only when pinn_rollout_mode: direct_exact.
+# Direct exact mode evaluates x(k-1+step) for each listed step using one
+# averaged-current exact solid step to step-1, then a final h=1 step.
+pinn_rollout_eval_steps: [1, 2, 5, 10, 30, 60, 120, 300]
+# Used only when pinn_rollout_mode: direct_exact. If true, late-profile windows
+# with limited future data are kept and only valid eval steps contribute to loss.
+pinn_allow_partial_rollout_windows: true
 integ_type: 0   # 0 = RK4, 1 = Euler
 electrolyte_integrator: implicit  # rk4 for debugging, implicit for h=1 training
 electrolyte_substeps: 1  # 1 for implicit, 5-20 for rk4 depending on h
@@ -116,8 +124,8 @@ lrate_sei: 0.001
 # no extra soft BC loss terms. BCs are enforced through reconstruction/integration.
 supervise_states: false
 
-eval_every: 100
-full_eval_every: 500
+eval_every: 20
+full_eval_every: 100
 profile_timing: false
 profile_timing_every: 20
 profile_timing_warmup_epochs: 5
