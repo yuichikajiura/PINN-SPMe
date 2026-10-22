@@ -679,7 +679,7 @@ def main():
     parser.add_argument(
         "checkpoint",
         nargs="?",
-        default="results/spme_pinn_from_nn_2000/checkpoint_latest.pth",
+        default="results/spme_pinn_direct_exact/checkpoint_latest.pth",
         help="Path to a PINN-SPMe checkpoint containing a history list.",
     )
     parser.add_argument(

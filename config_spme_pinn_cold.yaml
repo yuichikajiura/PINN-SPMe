@@ -1,0 +1,149 @@
+# Cold-start variant of config_spme_pinn.yaml for the warm-vs-cold stress test.
+# Identical to the reference config except: no pretrained NN checkpoint and a
+# separate save_dir. Repeat with several values of `seed`.
+model_type: spme
+method: pinn
+
+# Save / logging
+save_dir: results/spme_pinn_direct_exact_cold
+network_save_name: pinn_spme.pth
+history_save_name: pinn_spme_history.csv
+
+# Network
+batch_size: 8192
+layer_lstm: 1
+layer_fc: 1
+hidden_lstm: 32
+hidden_fc: 128
+epochs: 100000
+lrate: 0.001
+decay_step: 10000
+decay_rate: 0.9999
+activation: tanh
+network_output: raw
+seed: 1234
+print_every: 1
+checkpoint_every: 500   # keeps epochs 22,500 and 23,500 of the reference run; 100 wrote ~34 GB
+keep_last_checkpoint: true
+save_optimizer_state: true
+resume_from_checkpoint:
+pretrained_nn_checkpoint:   # empty = cold start (random NN weights, no supervised pretraining)
+
+# Weights & Biases logging
+use_wandb: false
+wandb_entity:            # optional W&B user or team; empty = your default entity
+wandb_project: pinn-spme
+wandb_run_name: spme-pinn
+wandb_mode: online
+wandb_plot_every: 1000
+wandb_plot_samples: 20
+
+# Sequence / integration
+k: 90
+h: 1
+pinn_rollout_steps: 120
+pinn_rollout_mode: direct_exact  # standard, direct_exact, or fast_rk4
+# Used only when pinn_rollout_mode: direct_exact or fast_rk4.
+# Direct exact mode evaluates x(k-1+step) for each listed step using one
+# averaged-current exact solid step to step-1, then a final h=1 step.
+# Fast RK4 mode evaluates the same sparse steps, but advances to step-1 using
+# RK4 chunks of up to fast_rk4_chunk_h seconds with averaged current, then a
+# final h=1 RK4 step with the sampled target current.
+pinn_rollout_eval_steps: [1, 2, 5, 10, 30, 60, 120, 240]
+# Used only when pinn_rollout_mode: direct_exact or fast_rk4. If true, late-profile windows
+# with limited future data are kept and only valid eval steps contribute to loss.
+pinn_allow_partial_rollout_windows: true
+fast_rk4_chunk_h: 3
+integ_type: 0   # 0 = RK4, 1 = Euler
+electrolyte_integrator: implicit  # rk4 for debugging, implicit for h=1 training
+electrolyte_substeps: 1  # 1 for implicit, 5-20 for rk4 depending on h
+
+# Data
+data_source: csv
+# Optional seeded Gaussian measurement noise on current [A] and voltage [V]
+# (state labels are not changed). 0 = off. noise_seed defaults to seed.
+noise_current_std: 0.0
+noise_voltage_std: 0.0
+noise_seed:
+data_dir: data
+train_data_files:
+  - spme_val_DST_soh90.csv
+  - id_HPPC_SOC030_rest120s_pulse10s_soh90.csv
+  - id_HPPC_SOC045_rest120s_pulse10s_soh90.csv
+  - id_HPPC_SOC060_rest120s_pulse10s_soh90.csv
+  - id_HPPC_SOC075_rest120s_pulse10s_soh90.csv
+  - id_HPPC_SOC090_rest120s_pulse10s_soh90.csv
+train_data_file_weights:
+  - 1.0  # spme_val_DST_soh90.csv
+  - 0.2  # id_HPPC_SOC030_rest120s_pulse10s_soh90.csv
+  - 0.2  # id_HPPC_SOC045_rest120s_pulse10s_soh90.csv
+  - 0.2  # id_HPPC_SOC060_rest120s_pulse10s_soh90.csv
+  - 0.2  # id_HPPC_SOC075_rest120s_pulse10s_soh90.csv
+  - 0.2  # id_HPPC_SOC090_rest120s_pulse10s_soh90.csv
+val_data_files:
+  - spme_train_BJDST_soh90.csv
+  - spme_train_FUDS_soh90.csv
+  - spme_train_US06_soh90.csv
+test_data_files:
+  - spme_debug_CC_1C_discharge_soh90.csv
+
+# Window controls.
+# PINN batches preserve temporal order within each profile and only shuffle
+# profile order. With w_integ > 0, integration consistency compares a rollout
+# column with the NN window that lands on the same time: in sparse modes only
+# pinn_rollout_eval_steps divisible by train_window_stride are used (5, 10, 30,
+# 60, 120, 240 for stride 5).
+train_window_stride: 5
+val_window_stride: 5
+max_train_windows:
+max_val_windows:
+shuffle_pinn_profiles: true
+
+# Input scaling
+OneC: 5.0
+max_Crate: 4
+V_upper: 4.2
+V_lower: 2.5
+
+# SPMe discretization
+n_r: 15
+n_x_n: 10
+n_x_s: 5
+n_x_p: 10
+ce_min: 200.0
+ce_max: 2000.0
+temperature_K: 298.15
+use_electrolyte_activity: false
+disable_electrolyte_ohmic: false
+disable_electrolyte_concentration: false
+
+# Core low-loss philosophy
+w_v: 1.0
+w_li_s: 1.0
+w_li_e: 1.0
+w_integ: 1.0
+estimate_nLi_s: false   # not implemented (must stay false)
+estimate_nLi_e: false   # not implemented (must stay false)
+estimate_delta_sei: true
+nLi_s_fresh: 0.2840
+nLi_s_init: 0.2840
+nLi_e_init: 0.0053677182
+delta_sei_init: 1.0e-12
+delta_sei_lower: 0.0
+delta_sei_upper: 2.0e-6
+delta_sei_true: 5.05188e-07
+epsilon_e_n_true: 0.0560283
+lrate_sei: 0.001
+
+# PINN follows the original SPM style: no true-state supervision loss and
+# no extra soft BC loss terms. BCs are enforced through reconstruction/integration.
+supervise_states: false
+
+eval_every: 20
+full_eval_every: 100
+profile_timing: false
+profile_timing_every: 20
+profile_timing_warmup_epochs: 5
+profile_timing_log_wandb: false
+debug_delta_sei_grad: false
+debug_delta_sei_grad_every: 20

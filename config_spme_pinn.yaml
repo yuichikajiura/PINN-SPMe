@@ -20,7 +20,7 @@ activation: tanh
 network_output: raw
 seed: 1234
 print_every: 1
-checkpoint_every: 100
+checkpoint_every: 500   # keeps epochs 22,500 and 23,500 of the reference run; 100 wrote ~34 GB
 keep_last_checkpoint: true
 save_optimizer_state: true
 resume_from_checkpoint:
@@ -28,6 +28,7 @@ pretrained_nn_checkpoint: results/spme_nn/checkpoint_epoch_0002000.pth
 
 # Weights & Biases logging
 use_wandb: false
+wandb_entity:            # optional W&B user or team; empty = your default entity
 wandb_project: pinn-spme
 wandb_run_name: spme-pinn
 wandb_mode: online
@@ -56,6 +57,11 @@ electrolyte_substeps: 1  # 1 for implicit, 5-20 for rk4 depending on h
 
 # Data
 data_source: csv
+# Optional seeded Gaussian measurement noise on current [A] and voltage [V]
+# (state labels are not changed). 0 = off. noise_seed defaults to seed.
+noise_current_std: 0.0
+noise_voltage_std: 0.0
+noise_seed:
 data_dir: data
 train_data_files:
   - spme_val_DST_soh90.csv
@@ -80,8 +86,10 @@ test_data_files:
 
 # Window controls.
 # PINN batches preserve temporal order within each profile and only shuffle
-# profile order. Use stride 1 when enabling w_integ so neighboring-window
-# integration consistency matches the original SPM PINN algorithm.
+# profile order. With w_integ > 0, integration consistency compares a rollout
+# column with the NN window that lands on the same time: in sparse modes only
+# pinn_rollout_eval_steps divisible by train_window_stride are used (5, 10, 30,
+# 60, 120, 240 for stride 5).
 train_window_stride: 5
 val_window_stride: 5
 max_train_windows:
@@ -111,8 +119,8 @@ w_v: 1.0
 w_li_s: 1.0
 w_li_e: 1.0
 w_integ: 1.0
-estimate_nLi_s: false
-estimate_nLi_e: false
+estimate_nLi_s: false   # not implemented (must stay false)
+estimate_nLi_e: false   # not implemented (must stay false)
 estimate_delta_sei: true
 nLi_s_fresh: 0.2840
 nLi_s_init: 0.2840

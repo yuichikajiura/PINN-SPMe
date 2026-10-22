@@ -441,6 +441,37 @@ def _load_spme_csv_dataset(files, p):
     }
 
 
+def _add_measurement_noise(split, cfg, split_name):
+    """Add seeded Gaussian noise to measured current/voltage (state labels untouched).
+
+    Controlled by cfg keys ``noise_current_std`` [A] and ``noise_voltage_std`` [V]
+    (both default 0 = off) and ``noise_seed`` (default: ``seed``). Train and
+    validation splits use different noise realizations.
+    """
+    std_i = float(cfg.get('noise_current_std', 0.0) or 0.0)
+    std_v = float(cfg.get('noise_voltage_std', 0.0) or 0.0)
+    if std_i <= 0.0 and std_v <= 0.0:
+        return split
+    base_seed = cfg.get('noise_seed')
+    if base_seed is None:
+        base_seed = cfg.get('seed', 0)
+    base_seed = int(base_seed)
+    rng = np.random.default_rng(base_seed + (0 if split_name == 'train' else 1))
+    currents, voltages = [], []
+    for profile in split['profiles']:
+        n = len(profile['current'])
+        if std_i > 0.0:
+            profile['current'] = (profile['current'] + rng.normal(0.0, std_i, n)).astype(np.float32)
+        if std_v > 0.0:
+            profile['voltage'] = (profile['voltage'] + rng.normal(0.0, std_v, n)).astype(np.float32)
+        currents.append(profile['current'])
+        voltages.append(profile['voltage'])
+    split['current'] = np.concatenate(currents).astype(np.float32)
+    split['voltage'] = np.concatenate(voltages).astype(np.float32)
+    print(f"  added measurement noise to {split_name}: current std {std_i:g} A, voltage std {std_v:g} V")
+    return split
+
+
 def _load_training_dataset(cfg, device, p):
     if cfg.get("data_source", "csv") != "csv" and not cfg.get("train_data_files"):
         raise ValueError("Only CSV-backed SPMe datasets are supported.")
@@ -452,6 +483,8 @@ def _load_training_dataset(cfg, device, p):
     print("Loaded SPMe CSV datasets:")
     print(f"  train files: {len(train_files)}, samples: {sum(train['lengths'])}")
     print(f"  val files:   {len(val_files)}, samples: {sum(val['lengths'])}")
+    train = _add_measurement_noise(train, cfg, 'train')
+    val = _add_measurement_noise(val, cfg, 'val')
     return {'train': train, 'val': val}
 
 
@@ -2241,6 +2274,12 @@ def train_nn(cfg, device, p):
 
 
 def train(cfg, device, p):
+    for flag in ('estimate_nLi_s', 'estimate_nLi_e'):
+        if cfg.get(flag, False):
+            raise NotImplementedError(
+                f"{flag}: true is not implemented; delta_sei is the only trainable physical parameter "
+                "(see spme_model.py). Set it to false."
+            )
     os.makedirs(cfg.get('save_dir', 'results'), exist_ok=True)
     start_time = time.time()
 

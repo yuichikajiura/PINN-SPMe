@@ -79,7 +79,7 @@ The reference result comes from one run, `results/spme_pinn_direct_exact/`, made
 | Parameter-error and validation-error tables | `results/spme_pinn_direct_exact/checkpoint_epoch_0023500.pth` |
 | Fresh-cell NN initialization | `results/spme_nn/checkpoint_epoch_0002000.pth` |
 
-Expected values at epoch 23,500: `delta_sei` = 5.0682e-7 m (true 5.05188e-7 m, +0.32%), `epsilon_e_n` = 0.055401, `nLi_s` = 0.248474 mol. The run continued to epoch 100,000 (`checkpoint_latest.pth`, `delta_sei` = 5.090e-7 m).
+Expected values at epoch 23,500: `delta_sei` = 5.0682e-7 m (true 5.05188e-7 m, +0.32%), `epsilon_e_n` = 0.055401, `nLi_s` = 0.248474 mol. Bare-NN validation voltage RMSE at epoch 23,500 is 6.46 / 5.96 / 5.65 mV for BJDST / FUDS / US06. The run continued to epoch 100,000 (`checkpoint_latest.pth`, `delta_sei` = 5.090e-7 m). It ran on a laptop CPU at about 3-3.6 s per epoch (epoch 23,500 after about 22 hours), without W&B.
 
 `results/` is git-ignored. The checkpoints above are distributed separately; place them at the paths shown.
 
@@ -162,7 +162,8 @@ Current SPMe configs:
 | File | Purpose |
 |---|---|
 | `config_spme_nn.yaml` | Supervised SPMe NN training against actual state labels. Use this first to test network capacity. |
-| `config_spme_pinn.yaml` | SPMe PINN training with rollout, voltage, conservation, and integration-consistency losses. |
+| `config_spme_pinn.yaml` | SPMe PINN training with rollout, voltage, conservation, and integration-consistency losses (reference config). |
+| `config_spme_pinn_cold.yaml` | Same as the reference config but without the pretrained NN checkpoint (cold start), saving to `results/spme_pinn_direct_exact_cold`. |
 
 ### Save And Logging Options
 
@@ -174,12 +175,13 @@ Current SPMe configs:
 | `print_every` | `50` | Console logging interval in epochs. |
 | `eval_every` | `50` | PINN diagnostic interval for a fixed small validation subset. Training still runs every epoch. |
 | `full_eval_every` | `500` | PINN diagnostic interval for full train/validation rollouts and full-profile W&B plots. |
-| `checkpoint_every` | `1000` | Epoch interval for full training checkpoints. |
+| `checkpoint_every` | `500` | Epoch interval for full training checkpoints (each PINN checkpoint is about 17 MB). |
 | `keep_last_checkpoint` | `true` | Also update `checkpoint_latest.pth` when periodic checkpoints are saved. |
 | `save_optimizer_state` | `true` | Store and restore optimizer states in checkpoints. |
 | `resume_from_checkpoint` | empty or path | Resume all three networks, optimizers, best validation value, and history from a checkpoint. |
 | `use_wandb` | `false` | Enables W&B logging when true. |
 | `wandb_project` | `pinn-spme` | W&B project name. |
+| `wandb_entity` | empty | Optional W&B user or team to log to; empty uses your default entity. |
 | `wandb_run_name` | `spme-nn-state-supervision` | W&B run name. |
 | `wandb_mode` | `online`, `offline`, `disabled` | W&B mode. Use `offline` to log locally. |
 | `wandb_plot_every` | `50` | Epoch interval for W&B plots. In PINN mode this controls full-profile plots independently from `full_eval_every`. |
@@ -272,6 +274,8 @@ For sparse modes, `pinn_rollout_steps` is metadata only; the active targets are 
 |---|---|---|
 | `data_source` | `csv` | Loads generated SPMe CSV datasets. |
 | `data_dir` | `data` | Base directory for relative data paths. |
+| `noise_current_std` / `noise_voltage_std` | `0.0` | Optional Gaussian measurement noise added to the loaded current [A] and voltage [V] of train and validation data (state labels unchanged). `0` = off. |
+| `noise_seed` | empty | Seed for the noise; empty uses `seed`. Train and validation get different realizations. |
 | `train_data_files` | `spme_val_DST_soh90.csv`, HPPC files | Training CSV files. Multiple files are concatenated while preserving sequence lengths for windowing. |
 | `val_data_files` | `spme_train_BJDST_soh90.csv`, ... | Validation CSV files. |
 | `test_data_files` | `spme_debug_CC_1C_discharge.csv` | Reserved for later test/evaluation scripts. |
@@ -437,7 +441,7 @@ Train/validation naming is swapped between the two configs on purpose. The file 
 Row timing:
 
 - `_soh90` files (generated 2026-07-07): row 1 is the initial state with `current_A = 0`; row k holds the state and voltage after applying row k's current.
-- Fresh files (generated 2026-06-30, used for NN pretraining) predate that fix: the voltage in row k was computed with the current of row k-1. Regenerating them with v5 and retraining the NN is an open item.
+- Fresh files (generated 2026-06-30, used for NN pretraining) predate that fix: the voltage in row k was computed with the current of row k-1. They can be converted exactly with `python tools/realign_current_column.py <in.csv> <out.csv>` (shifting `current_A` down one row reproduces the regenerated degraded files to machine precision). Retraining the NN on realigned fresh data is an open item.
 
 The degraded files were regenerated three times under the same names. Older versions exist only in git history (`git show <commit>:data/<file>`):
 
@@ -505,9 +509,10 @@ Inside `spme_pinn_direct_exact/`, `checkpoint_interrupt_epoch_*.pth` are local d
 ## Known Issues
 
 - **NaN from negative electrolyte concentration.** The NN outputs raw `c_e` with no positivity constraint, and `electrolyte_conductivity` evaluates `c^1.5`. With `w_integ = 0` or `w_li_e = 0`, `c_e` can drift negative and the loss becomes NaN. Keep both weights above zero.
-- **Sparse integration loss depends on the stride.** Only `pinn_rollout_eval_steps` divisible by `train_window_stride` feed `loss_integ`. The config comment "use stride 1 when enabling w_integ" is outdated.
-- **Disk use.** `checkpoint_every: 100` with 100,000 epochs writes about 1,000 checkpoints (34 GB). Use 1,000 or more for new runs.
-- **Row timing.** Fresh and degraded datasets use different row conventions (see Data).
+- **Sparse integration loss depends on the stride.** Only `pinn_rollout_eval_steps` divisible by `train_window_stride` feed `loss_integ`. Keep them consistent if you change the stride.
+- **Disk use.** The reference run used `checkpoint_every: 100` (about 1,000 checkpoints, 34 GB). The config now uses 500, which still saves epochs 22,500 and 23,500.
+- **Row timing.** Fresh and degraded datasets use different row conventions (see Data). `tools/realign_current_column.py` converts old-timing files exactly by shifting `current_A` down one row; the fresh NN-pretraining files have not been realigned yet.
+- **Unimplemented flags.** `estimate_nLi_s` and `estimate_nLi_e` are not implemented; `delta_sei` is the only trainable physical parameter, and setting either flag to true stops training with an error.
 
 ---
 
@@ -518,6 +523,7 @@ PINN-SPMe/
 |-- main.py                         # SPMe entry point; dispatches by method
 |-- config_spme_nn.yaml             # SPMe supervised NN state training
 |-- config_spme_pinn.yaml           # SPMe PINN training (reference config)
+|-- config_spme_pinn_cold.yaml      # Cold-start variant (no NN pretraining)
 |-- train_pinn_spme.py              # Shared SPMe NN/PINN training code (standard, direct_exact, fast_rk4 rollouts)
 |-- pinn_spme_network.py            # SPMe neural state estimator (three LSTMs)
 |-- custom_lstm.py                  # LSTM + FC block with raw-concentration output scaling
@@ -531,6 +537,7 @@ PINN-SPMe/
 |-- benchmark_rollout_integrators.py# Diagnostic: integrator benchmark
 |-- diagnose_film_drop.py           # Diagnostic: SEI film voltage drop
 |-- data/                           # SPMe CSV data (fresh + degraded _soh90)
+|-- tools/realign_current_column.py # Convert old row-timing CSVs to the current convention
 |-- tests/                          # SPMe verification tests
 `-- results/                        # Saved models, histories, plots (git-ignored)
 ```
