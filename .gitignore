@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.DS_Store
+.idea/
+.matplotlib-cache/
+wandb/
+results/
+*.zip
+LGM50/
+cuda_installer.pyz

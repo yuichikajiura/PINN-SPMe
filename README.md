@@ -47,7 +47,13 @@ After NN capacity looks reasonable, run the SPMe PINN path:
 python main.py config_spme_pinn.yaml
 ```
 
-This trains using SPMe rollout losses, voltage loss, separate solid/electrolyte lithium conservation losses, and SPM-style integration consistency.
+The current PINN config starts from the supervised NN checkpoint:
+
+```yaml
+pretrained_nn_checkpoint: results/spme_nn/checkpoint_epoch_0002000.pth
+```
+
+It trains through sparse SPMe rollout targets using voltage loss, solid/electrolyte lithium inventory losses, SEI degradation estimation, and integration consistency between rolled states and neighboring NN predictions.
 
 ---
 
@@ -142,9 +148,9 @@ Current SPMe configs:
 |---|---|---|
 | `batch_size` | `256` | Training batch size. |
 | `layer_lstm` | `1` | Number of LSTM layers in each state block. |
-| `hidden_lstm` | `64` | LSTM hidden dimension. |
+| `hidden_lstm` | `32` | LSTM hidden dimension. |
 | `layer_fc` | `1` | Number of fully connected hidden layers after the LSTM. |
-| `hidden_fc` | `256` | Width of each fully connected hidden layer. |
+| `hidden_fc` | `128` | Width of each fully connected hidden layer. |
 | `activation` | `tanh` | Activation used by the custom LSTM/FC block. |
 | `network_output` | `raw` | SPMe uses SPM-style `CustomLSTM` output scaling to raw physical concentrations. |
 | `epochs` | `1000` | Number of training epochs. |
@@ -183,8 +189,12 @@ loss = loss_c_s_n + loss_c_e + loss_c_s_p
 |---|---|---|
 | `k` | `90` | LSTM input history length only: number of historical current/voltage samples fed to the network. |
 | `h` | `1` | Model integration step in seconds for SPMe rollout. |
-| `pinn_rollout_steps` | `90` | PINN rollout length: number of SPMe integration steps used for voltage, lithium, and integration-consistency losses. |
-| `integ_type` | `1` | Solid-state integrator option: `0` = RK4, `1` = Euler. |
+| `pinn_rollout_steps` | `120` | Dense PINN rollout length for `standard` mode. In sparse modes this is metadata; `pinn_rollout_eval_steps` controls target offsets. |
+| `pinn_rollout_mode` | `standard`, `direct_exact`, `fast_rk4` | Rollout strategy for PINN targets. See sparse rollout notes below. |
+| `pinn_rollout_eval_steps` | `[1, 2, 5, 10, 30, 60, 120, 240]` | Sparse target offsets from the end of the input window for `direct_exact` and `fast_rk4`. |
+| `pinn_allow_partial_rollout_windows` | `true` | Keep late-profile windows even when only some sparse future targets are available; invalid targets are masked from loss. |
+| `fast_rk4_chunk_h` | `3` | For `fast_rk4`, roll to one second before each sparse target using RK4 chunks up to this duration with averaged current. |
+| `integ_type` | `0` | Solid-state integrator option: `0` = RK4, `1` = Euler. |
 | `electrolyte_integrator` | `implicit` | SPMe electrolyte integrator: `implicit` for training, `rk4` for debugging/reference. |
 | `electrolyte_substeps` | `1` | RK4 electrolyte substeps when `electrolyte_integrator: rk4`. Keep `1` for implicit training. |
 
@@ -198,17 +208,25 @@ electrolyte_substeps: 1
 
 The explicit RK4 electrolyte path is retained as a reference/debug option.
 
+PINN rollout modes:
+
+- `standard`: dense rollout using `model.forward(...)` and `i_future_ave`; every rollout column corresponds to a regular integration step.
+- `direct_exact`: sparse rollout at `pinn_rollout_eval_steps`; each target uses one averaged-current exact solid step to `step - 1`, then a final `h=1` step with sampled target current. Electrolyte still uses the configured SPMe electrolyte step.
+- `fast_rk4`: sparse rollout at the same target steps; each target advances to `step - 1` through RK4 chunks of up to `fast_rk4_chunk_h`, then takes a final `h=1` RK4 step.
+
+For sparse modes, `pinn_rollout_steps` is metadata only; the active targets are `pinn_rollout_eval_steps`.
+
 ### Data Options
 
 | Option | Example | Meaning |
 |---|---|---|
 | `data_source` | `csv` | Loads generated SPMe CSV datasets. |
 | `data_dir` | `data` | Base directory for relative data paths. |
-| `train_data_files` | `spme_train_BJDST_soh90.csv` | Training CSV files. Multiple files are concatenated while preserving sequence lengths for windowing. |
-| `val_data_files` | `spme_val_DST_soh90.csv` | Validation CSV files. |
+| `train_data_files` | `spme_val_DST_soh90.csv`, HPPC files | Training CSV files. Multiple files are concatenated while preserving sequence lengths for windowing. |
+| `val_data_files` | `spme_train_BJDST_soh90.csv`, ... | Validation CSV files. |
 | `test_data_files` | `spme_debug_CC_1C_discharge.csv` | Reserved for later test/evaluation scripts. |
-| `train_window_stride` | `30` | Spacing between NN windows. In PINN integration consistency, adjacent NN window `j+1` corresponds to this many rollout steps later. |
-| `val_window_stride` | `30` | Spacing between validation NN windows. |
+| `train_window_stride` | `5` | Spacing between NN windows. In PINN integration consistency, adjacent NN window `j+1` corresponds to this many rollout seconds later. |
+| `val_window_stride` | `5` | Spacing between validation NN windows. |
 | `max_train_windows` | empty or integer | Optional cap on sampled train windows for smoke tests. |
 | `max_val_windows` | empty or integer | Optional cap on sampled validation windows for smoke tests. |
 | `shuffle_pinn_profiles` | `true` | In PINN mode, shuffle profile order only; windows inside each batch remain temporally ordered. |
@@ -264,7 +282,7 @@ Used by `config_spme_pinn.yaml` with `method: pinn`.
 |---|---|---|
 | `w_v` | `1.0` | Voltage loss weight. |
 | `w_li_s` | `1.0` | Solid lithium conservation loss weight. |
-| `w_li_e` | `0.0` | Electrolyte lithium conservation loss weight. Keep `0.0` initially for SEI estimation. |
+| `w_li_e` | `1.0` | Electrolyte lithium conservation loss weight. Keeping this enabled helps prevent unphysical electrolyte drift. |
 | `w_integ` | `1.0` | SPM-style integration consistency loss weight across anode, electrolyte, and cathode blocks. |
 | `estimate_delta_sei` | `true` | Train one scaled SEI thickness parameter, `delta_sei_scaled`. |
 | `delta_sei_init` | `1.0e-12` | Initial SEI thickness estimate in meters. Fresh-cell SEI is zero. |
@@ -303,9 +321,29 @@ loss_li_s = RMSE((nLi_s_nn - nLi_s_est) / nLi_s_init)
 loss_li_e = RMSE((nLi_e_nn - nLi_e_est) / nLi_e_init)
 ```
 
-The current default keeps `w_li_e: 0.0`; electrolyte inventory is derived from porosity for diagnostics but is not used as a training target unless that weight is enabled.
+The current PINN config keeps `w_li_e: 1.0`. This is important because voltage loss alone can reduce while the raw NN electrolyte state moves into unphysical concentration ranges.
 
-For PINN integration consistency, SPMe follows the original SPM batching strategy: batches contain consecutive windows from a single profile, each NN is evaluated once for that batch, SPMe rolls the predicted initial states forward for `pinn_rollout_steps`, and `loss_integ` compares rolled future states with already-computed neighboring NN predictions by tensor slicing. Shifted windows are not sent through the LSTMs again. With `train_window_stride: 30` and `pinn_rollout_steps: 90`, the integration loss compares rolled `t+30`, `t+60`, and `t+90` states to NN windows `+1`, `+2`, and `+3`.
+For PINN integration consistency, SPMe follows the original SPM batching strategy: batches contain consecutive windows from a single profile, each NN is evaluated once for that batch, SPMe rolls the predicted initial states forward, and `loss_integ` compares rolled future states with already-computed neighboring NN predictions by tensor slicing. Shifted windows are not sent through the LSTMs again.
+
+For `standard` rollout, integration consistency uses dense rollout columns. With `train_window_stride: 5`, rolled `t+5`, `t+10`, `t+15`, ... states are compared to NN windows `+1`, `+2`, `+3`, ...
+
+For sparse modes (`direct_exact` and `fast_rk4`), integration consistency uses only sparse eval steps divisible by `train_window_stride`. With the current:
+
+```yaml
+train_window_stride: 5
+pinn_rollout_eval_steps: [1, 2, 5, 10, 30, 60, 120, 240]
+```
+
+the integration loss uses `5, 10, 30, 60, 120, 240`, and treats `1` and `2` as voltage/inventory-only sparse targets. The mapping is:
+
+```text
+eval step 5   -> NN window +1
+eval step 10  -> NN window +2
+eval step 30  -> NN window +6
+eval step 60  -> NN window +12
+eval step 120 -> NN window +24
+eval step 240 -> NN window +48
+```
 
 In `method: nn`, the network is trained directly against state labels using grouped normalized losses for scale balance. The outputs and plots remain raw physical concentrations.
 
@@ -324,8 +362,13 @@ Current generated SPMe files:
 - `spme_train_US06_soh90.csv`
 - `spme_val_DST_soh90.csv`
 - `spme_debug_CC_1C_discharge_soh90.csv`
+- `id_HPPC_SOC030_rest120s_pulse10s_soh90.csv`
+- `id_HPPC_SOC045_rest120s_pulse10s_soh90.csv`
+- `id_HPPC_SOC060_rest120s_pulse10s_soh90.csv`
+- `id_HPPC_SOC075_rest120s_pulse10s_soh90.csv`
+- `id_HPPC_SOC090_rest120s_pulse10s_soh90.csv`
 
-These are used by `config_spme_nn.yaml` and `config_spme_pinn.yaml`.
+`config_spme_nn.yaml` currently uses the non-`_soh90` drive-cycle files for supervised state training. `config_spme_pinn.yaml` currently uses `_soh90` drive-cycle validation files plus the HPPC pulse files for PINN training.
 
 ## Tests And Verification
 
