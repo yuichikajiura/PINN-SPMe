@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate dissertation-ready SPMe PINN/NN figures.
+"""Generate publication-ready SPMe PINN/NN figures.
 
 The script creates figures for:
 1. Training current/voltage profiles.
@@ -654,7 +654,7 @@ def main():
     plot_config.update(config)
 
     data_dir = Path(plot_config.get("data_dir", "data"))
-    output_dir = Path(args.output_dir) if args.output_dir else checkpoint_path.parent / "dissertation_figures"
+    output_dir = Path(args.output_dir) if args.output_dir else checkpoint_path.parent / "result_figures"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     train_files = args.train_files if args.train_files is not None else plot_config.get("train_data_files", [])
@@ -681,7 +681,7 @@ def main():
     parameter_report_path, parameter_frame = _write_parameter_error_report(checkpoint, output_dir)
     state_report_path, state_frame = _write_state_error_report(prediction_results, model, output_dir)
     summary_path = _write_text_error_summary(parameter_frame, state_frame, output_dir)
-    print(f"Saved dissertation figures to: {output_dir}")
+    print(f"Saved result figures to: {output_dir}")
     print(f"Saved numerical parameter errors to: {parameter_report_path}")
     print(f"Saved numerical trajectory errors to: {state_report_path}")
     print(f"Saved numerical error summary to: {summary_path}")
